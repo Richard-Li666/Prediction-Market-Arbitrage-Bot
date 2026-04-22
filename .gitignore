@@ -1,0 +1,6 @@
+build/
+cmake-build-*/
+data/
+*.log
+.DS_Store
+compile_commands.json
