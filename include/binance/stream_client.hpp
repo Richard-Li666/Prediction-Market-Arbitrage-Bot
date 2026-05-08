@@ -18,8 +18,7 @@ class Pipeline;
 namespace ll::binance {
 
 struct StreamClientConfig {
-  /// Spot streams host. Default is Binance.US (`stream.binance.us`) where `.com` may return 451.
-  /// Override with `--host` or env `LL_BINANCE_WS_HOST`.
+  /// Spot streams host (default: global `stream.binance.com`). Override with `--host` or `LL_BINANCE_WS_HOST`.
   std::string ws_host = "stream.binance.com";
   int ws_port = 9443;
   /// Raw stream path, e.g. `/ws/btcusdt@bookTicker` or `/ws/btcusdt@trade`.

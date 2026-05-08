@@ -1,0 +1,2 @@
+/usr/bin/ar qc libll_execution.a CMakeFiles/ll_execution.dir/src/execution/paper_executor.cpp.o CMakeFiles/ll_execution.dir/src/execution/live_executor.cpp.o CMakeFiles/ll_execution.dir/src/execution/poly_daemon_client.cpp.o
+/usr/bin/ranlib libll_execution.a

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libll_polymarket.a CMakeFiles/ll_polymarket.dir/src/polymarket/rest_quote.cpp.o CMakeFiles/ll_polymarket.dir/src/polymarket/ws_market_client.cpp.o CMakeFiles/ll_polymarket.dir/src/polymarket/gamma_bootstrap.cpp.o CMakeFiles/ll_polymarket.dir/src/polymarket/bucket_market_discovery.cpp.o CMakeFiles/ll_polymarket.dir/src/polymarket/poly_ws_quote_feed.cpp.o CMakeFiles/ll_polymarket.dir/src/polymarket/ws_fixed_token_feed.cpp.o
+/usr/bin/ranlib libll_polymarket.a

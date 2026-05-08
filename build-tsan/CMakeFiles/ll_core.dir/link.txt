@@ -1,0 +1,2 @@
+/usr/bin/ar qc libll_core.a CMakeFiles/ll_core.dir/src/core/thread_pool.cpp.o
+/usr/bin/ranlib libll_core.a

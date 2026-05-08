@@ -1,0 +1,1 @@
+/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/replay_align.dir/apps/replay_align.cpp.o -o replay_align  libll_replay.a libll_core.a

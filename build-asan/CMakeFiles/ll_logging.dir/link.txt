@@ -1,0 +1,2 @@
+/usr/bin/ar qc libll_logging.a CMakeFiles/ll_logging.dir/src/logging/jsonl_writer.cpp.o
+/usr/bin/ranlib libll_logging.a

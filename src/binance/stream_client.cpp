@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 
 #include "core/clock.hpp"
+#include "core/sync_cerr.hpp"
 #include "core/thread_pool.hpp"
 #include "telemetry/pipeline.hpp"
 
@@ -85,16 +86,22 @@ bool StreamClient::start(const StreamClientConfig& cfg) {
       return;
     }
     if (msg->type == ix::WebSocketMessageType::Open) {
-      std::cerr << "[binance_ws] connected " << url_str << "\n";
+      { ll::io::SyncCerrLock _; std::cerr << "[binance_ws] connected " << url_str << "\n"; }
       return;
     }
     if (msg->type == ix::WebSocketMessageType::Close) {
-      std::cerr << "[binance_ws] closed code=" << msg->closeInfo.code << " reason=" << msg->closeInfo.reason
-                << "\n";
+      {
+        ll::io::SyncCerrLock _;
+        std::cerr << "[binance_ws] closed code=" << msg->closeInfo.code << " reason=" << msg->closeInfo.reason
+                  << "\n";
+      }
       return;
     }
     if (msg->type == ix::WebSocketMessageType::Error) {
-      std::cerr << "[binance_ws] error reason=" << msg->errorInfo.reason << " message=" << msg->str << "\n";
+      {
+        ll::io::SyncCerrLock _;
+        std::cerr << "[binance_ws] error reason=" << msg->errorInfo.reason << " message=" << msg->str << "\n";
+      }
       return;
     }
     if (msg->type != ix::WebSocketMessageType::Message) {
@@ -151,7 +158,7 @@ bool StreamClient::start(const StreamClientConfig& cfg) {
     };
 
     if (impl_->pool) {
-      impl_->pool->enqueue(std::move(handle));
+      impl_->pool->dispatch(ll::core::ThreadPool::Task{std::move(handle)});
     } else {
       handle();
     }

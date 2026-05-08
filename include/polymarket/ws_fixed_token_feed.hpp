@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 
+#include "core/thread_pool.hpp"
 #include "polymarket/polymarket_types.hpp"
 #include "polymarket/ws_market_client.hpp"
 
@@ -27,6 +28,9 @@ class WsFixedTokenQuoteFeed {
 
   void set_on_quote(QuoteFn fn);
 
+  /// Optional: offload JSON parsing to a ThreadPool (0 = inline parse on WS thread).
+  void set_parse_workers(std::size_t n);
+
   /// Optional labels copied into each `PolymarketWsQuote` (safe to call before `start` and while running).
   void set_market_context(const std::string& event_slug, std::int64_t market_bucket_epoch,
                           const std::string& outcome);
@@ -48,6 +52,7 @@ class WsFixedTokenQuoteFeed {
   void on_ws_open();
   void on_ws_closed();
   void on_ws_message(const std::string& s);
+  void on_ws_message_inner(const std::string& s);
   void emit_quote(const std::string& asset_id, double bid, double ask, const std::string& dedup_ts);
 
   telemetry::Pipeline* tel_;
@@ -65,6 +70,8 @@ class WsFixedTokenQuoteFeed {
   double last_emitted_ask_{0};
   std::uint64_t msg_count_{0};
   bool running_{false};
+  std::size_t parse_workers_{0};
+  std::unique_ptr<ll::core::ThreadPool> pool_;
 };
 
 }  // namespace ll::polymarket

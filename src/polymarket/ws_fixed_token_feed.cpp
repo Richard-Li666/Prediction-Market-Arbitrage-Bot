@@ -105,6 +105,8 @@ WsFixedTokenQuoteFeed::~WsFixedTokenQuoteFeed() { stop(); }
 
 void WsFixedTokenQuoteFeed::set_on_quote(QuoteFn fn) { on_quote_ = std::move(fn); }
 
+void WsFixedTokenQuoteFeed::set_parse_workers(std::size_t n) { parse_workers_ = n; }
+
 void WsFixedTokenQuoteFeed::set_market_context(const std::string& event_slug,
                                                std::int64_t market_bucket_epoch,
                                                const std::string& outcome) {
@@ -133,6 +135,11 @@ bool WsFixedTokenQuoteFeed::start(const std::string& token_id, std::string* erro
     token_id_ = token_id;
   }
   msg_count_ = 0;
+  if (parse_workers_ > 0) {
+    pool_ = std::make_unique<ll::core::ThreadPool>(parse_workers_);
+  } else {
+    pool_.reset();
+  }
 
   ws_.set_subscription_snapshot({token_id});
   ws_.set_on_open([this] { on_ws_open(); });
@@ -157,6 +164,10 @@ void WsFixedTokenQuoteFeed::stop() {
     return;
   }
   ws_.stop();
+  if (pool_) {
+    pool_->wait_idle();
+    pool_.reset();
+  }
   running_ = false;
   {
     std::lock_guard<std::mutex> lk(sub_mu_);
@@ -187,6 +198,15 @@ void WsFixedTokenQuoteFeed::on_ws_message(const std::string& s) {
     tel_->mark("poly_ws_msg", ll::core::steady_ns());
   }
 
+  if (pool_) {
+    const std::string copy = s;
+    pool_->dispatch(ll::core::ThreadPool::Task{[this, copy]() { on_ws_message_inner(copy); }});
+    return;
+  }
+  on_ws_message_inner(s);
+}
+
+void WsFixedTokenQuoteFeed::on_ws_message_inner(const std::string& s) {
   nlohmann::json j;
   try {
     j = nlohmann::json::parse(s);

@@ -1,5 +1,9 @@
 #include "core/thread_pool.hpp"
 
+#ifndef LEADLAG_POOL_USE_JTHREAD
+#define LEADLAG_POOL_USE_JTHREAD 0
+#endif
+
 namespace ll::core {
 
 ThreadPool::ThreadPool(std::size_t workers) {
@@ -15,18 +19,22 @@ ThreadPool::~ThreadPool() {
     stop_ = true;
   }
   cv_.notify_all();
+#if LEADLAG_POOL_USE_JTHREAD
+  workers_.clear();
+#else
   for (auto& t : workers_) {
     if (t.joinable()) {
       t.join();
     }
   }
+#endif
 }
 
-void ThreadPool::enqueue(std::function<void()> job) {
+void ThreadPool::dispatch(Task task) {
   inflight_.fetch_add(1, std::memory_order_acq_rel);
   {
     std::lock_guard<std::mutex> lk(mu_);
-    tasks_.push(std::move(job));
+    tasks_.push(std::move(task.fn));
   }
   cv_.notify_one();
 }

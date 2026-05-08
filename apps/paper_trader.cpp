@@ -1,18 +1,23 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "btc_poly_runner.hpp"
 #include "core/clock.hpp"
 #include "execution/executor.hpp"
 #include "replay/timeline_merge.hpp"
 #include "signals/engine.hpp"
 #include "sim/latency_backtest.hpp"
 
-int main(int argc, char** argv) {
+namespace {
+
+int run_offline(int argc, char** argv) {
   if (argc < 4) {
-    std::cerr << "usage: paper_trader <config.json> <binance.jsonl> <polymarket.jsonl>\n";
+    std::cerr << "usage: paper_trader <config.json> <binance.jsonl> <polymarket.jsonl>\n"
+                 "   or: paper_trader --live [options]\n";
     return 2;
   }
 
@@ -59,6 +64,25 @@ int main(int argc, char** argv) {
     std::cout << "latency_ms=" << r.latency_ms << " fills=" << r.fills
               << " pnl_prob_pts=" << r.pnl_probability_points << "\n";
   }
-
   return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  // Full live-mode flags are documented in run_live_impl; that path expects argv[1] == --live.
+  if (argc >= 2 && std::string(argv[1]) == "--help") {
+    std::cerr << "Offline replay: paper_trader <config.json> <binance.jsonl> <polymarket.jsonl>\n\n";
+    std::vector<std::string> storage = {argv[0], "--live", "--help"};
+    std::vector<char*> av;
+    av.reserve(storage.size());
+    for (auto& s : storage) {
+      av.push_back(s.data());
+    }
+    return ll::btc_poly::run_strategy_main(static_cast<int>(av.size()), av.data(), false);
+  }
+  if (argc >= 2 && std::string(argv[1]) == "--live") {
+    return ll::btc_poly::run_strategy_main(argc, argv, false);
+  }
+  return run_offline(argc, argv);
 }

@@ -24,19 +24,23 @@ int main(int argc, char** argv) {
 
   if (argc < 2) {
     std::cerr << "usage: binance_logger <out.jsonl> [--host HOST] [--port P] [--stream trade|bookTicker] "
-                 "[--parse-workers N]\n"
+                 "[--parse-workers N] [--no-dedup]\n"
                  "  default: stream.binance.us + btcusdt@bookTicker\n"
-                 "  bookTicker JSONL omits rows where best bid/ask prices are unchanged vs previous row.\n";
+                 "  bookTicker JSONL omits rows where best bid/ask prices are unchanged vs previous row.\n"
+                 "  --no-dedup disables bookTicker bid/ask dedup.\n";
     return 2;
   }
 
   const std::string out_path = argv[1];
   std::size_t parse_workers = 0;
+  bool no_dedup = false;
   ll::binance::StreamClientConfig cfg;
   ll::binance::apply_stream_env_overrides(cfg);
   for (int i = 2; i < argc; ++i) {
     if (std::string(argv[i]) == "--parse-workers" && i + 1 < argc) {
       parse_workers = static_cast<std::size_t>(std::stoul(argv[++i]));
+    } else if (std::string(argv[i]) == "--no-dedup") {
+      no_dedup = true;
     } else if (std::string(argv[i]) == "--host" && i + 1 < argc) {
       cfg.ws_host = argv[++i];
     } else if (std::string(argv[i]) == "--port" && i + 1 < argc) {
@@ -72,7 +76,7 @@ int main(int argc, char** argv) {
 
   client.set_on_bookticker([&](const ll::core::BookTickerTick& b) {
     std::lock_guard<std::mutex> lk(book_dedup_mu);
-    if (have_last_book && b.bid_price == last_bid_price && b.ask_price == last_ask_price) {
+    if (!no_dedup && have_last_book && b.bid_price == last_bid_price && b.ask_price == last_ask_price) {
       return;
     }
     have_last_book = true;

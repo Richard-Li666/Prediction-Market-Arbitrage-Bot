@@ -3,11 +3,15 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
+#include <ctime>
 #include <curl/curl.h>
 #include <cstdint>
 #include <mutex>
 #include <sstream>
 #include <string>
+
+#include <cmath>
 
 #include <nlohmann/json.hpp>
 
@@ -171,7 +175,8 @@ std::string slug_for_bucket(std::int64_t bucket_ts) {
 }
 
 bool fetch_events_for_slug(const std::string& slug, nlohmann::json* out_events_array, std::string* err) {
-  const std::string url = "https://gamma-api.polymarket.com/events?slug=" + slug;
+  const std::string url =
+      "https://gamma-api.polymarket.com/events?slug=" + slug + "&includeMetadata=true";
   std::string body;
   if (!http_get(url, &body, err)) {
     return false;
@@ -213,6 +218,166 @@ const nlohmann::json* find_market_for_slug(const nlohmann::json& event, const st
   return only.is_object() ? &only : nullptr;
 }
 
+bool fetch_events_by_id_for_metadata(const std::string& event_id, nlohmann::json* out_events_array,
+                                    std::string* err) {
+  if (event_id.empty()) {
+    if (err) {
+      *err = "gamma event id empty";
+    }
+    return false;
+  }
+  const std::string url =
+      "https://gamma-api.polymarket.com/events?id=" + event_id + "&includeMetadata=true";
+  std::string body;
+  if (!http_get(url, &body, err)) {
+    return false;
+  }
+  try {
+    const auto j = nlohmann::json::parse(body);
+    if (!j.is_array()) {
+      if (err) {
+        *err = "gamma events?id response is not an array";
+      }
+      return false;
+    }
+    *out_events_array = std::move(j);
+    return true;
+  } catch (const std::exception& ex) {
+    if (err) {
+      *err = ex.what();
+    }
+    return false;
+  }
+}
+
+bool event_metadata_object(const nlohmann::json& event, nlohmann::json* out_em, std::string* err) {
+  if (!event.contains("eventMetadata")) {
+    if (err) {
+      *err = "gamma event missing eventMetadata";
+    }
+    return false;
+  }
+  const auto& meta = event.at("eventMetadata");
+  if (meta.is_null()) {
+    if (err) {
+      *err = "gamma eventMetadata is null";
+    }
+    return false;
+  }
+  if (meta.is_object()) {
+    *out_em = meta;
+    return true;
+  }
+  if (meta.is_string()) {
+    try {
+      const auto parsed = nlohmann::json::parse(meta.get<std::string>());
+      if (!parsed.is_object()) {
+        if (err) {
+          *err = "gamma eventMetadata string is not a JSON object";
+        }
+        return false;
+      }
+      *out_em = std::move(parsed);
+      return true;
+    } catch (const std::exception& ex) {
+      if (err) {
+        *err = std::string("gamma eventMetadata string parse failed: ") + ex.what();
+      }
+      return false;
+    }
+  }
+  if (err) {
+    *err = "gamma eventMetadata has unsupported type";
+  }
+  return false;
+}
+
+bool extract_price_to_beat_from_gamma_event(const nlohmann::json& event, double* out_ptb,
+                                            std::string* err) {
+  nlohmann::json em;
+  if (!event_metadata_object(event, &em, err)) {
+    return false;
+  }
+  if (!em.contains("priceToBeat")) {
+    if (err) {
+      *err = "gamma eventMetadata missing priceToBeat";
+    }
+    return false;
+  }
+  const auto& v = em.at("priceToBeat");
+  double ptb = 0.0;
+  try {
+    if (v.is_number()) {
+      ptb = v.get<double>();
+    } else if (v.is_string()) {
+      ptb = std::stod(v.get<std::string>());
+    } else {
+      if (err) {
+        *err = "gamma priceToBeat has unsupported JSON type";
+      }
+      return false;
+    }
+  } catch (...) {
+    if (err) {
+      *err = "failed to parse priceToBeat as number";
+    }
+    return false;
+  }
+  if (!std::isfinite(ptb) || ptb <= 0.0) {
+    if (err) {
+      *err = "gamma priceToBeat invalid (non-finite or <= 0)";
+    }
+    return false;
+  }
+  *out_ptb = ptb;
+  return true;
+}
+
+/// Parses Gamma ISO timestamps like `2026-05-06T23:05:00Z` / fractional seconds into unix milliseconds (UTC).
+bool gamma_iso8601_utc_to_unix_ms(const std::string& in, std::int64_t* out_ms) {
+  std::string s = in;
+  while (!s.empty() && (s.back() == 'Z' || s.back() == 'z')) {
+    s.pop_back();
+  }
+  int year = 0;
+  int month = 0;
+  int day = 0;
+  int hour = 0;
+  int minute = 0;
+  double sec_f = 0.0;
+  const int n = std::sscanf(s.c_str(), "%d-%d-%dT%d:%d:%lf", &year, &month, &day, &hour, &minute, &sec_f);
+  if (n != 6 || year < 1970 || month < 1 || month > 12 || day < 1 || day > 31) {
+    return false;
+  }
+  const int sec_whole = static_cast<int>(sec_f);
+  const double frac = sec_f - static_cast<double>(sec_whole);
+  int frac_ms = static_cast<int>(std::lround(frac * 1000.0));
+  if (frac_ms >= 1000) {
+    frac_ms = 999;
+  }
+  if (frac_ms < 0) {
+    frac_ms = 0;
+  }
+  std::tm tm{};
+  tm.tm_year = year - 1900;
+  tm.tm_mon = month - 1;
+  tm.tm_mday = day;
+  tm.tm_hour = hour;
+  tm.tm_min = minute;
+  tm.tm_sec = sec_whole;
+  tm.tm_isdst = 0;
+#if defined(_WIN32)
+  const std::time_t tt = _mkgmtime(&tm);
+#else
+  const std::time_t tt = timegm(&tm);
+#endif
+  if (tt == static_cast<std::time_t>(-1)) {
+    return false;
+  }
+  *out_ms = static_cast<std::int64_t>(tt) * 1000LL + static_cast<std::int64_t>(frac_ms);
+  return true;
+}
+
 bool parse_bucket_epoch_from_slug(const std::string& slug, std::int64_t* out_epoch) {
   static constexpr char kPrefix[] = "btc-updown-5m-";
   constexpr std::size_t plen = sizeof(kPrefix) - 1;
@@ -231,6 +396,8 @@ bool parse_bucket_epoch_from_slug(const std::string& slug, std::int64_t* out_epo
 
 bool validate_and_extract(const nlohmann::json& event, const std::string& want_slug,
                           BtcFiveMinuteBucketDiscovery& out, std::string* err) {
+  out.event_start_wall_ms = -1;
+  out.strike_from_polymarket_rtds_chainlink = false;
   if (event.value("slug", std::string{}) != want_slug) {
     if (err) {
       *err = "event slug mismatch after fetch";
@@ -300,6 +467,50 @@ bool validate_and_extract(const nlohmann::json& event, const std::string& want_s
   } else {
     out.bucket_epoch_seconds = be;
   }
+
+  std::string start_iso = m.value("eventStartTime", std::string{});
+  if (start_iso.empty()) {
+    start_iso = event.value("startTime", std::string{});
+  }
+  if (!start_iso.empty()) {
+    std::int64_t pms = -1;
+    if (gamma_iso8601_utc_to_unix_ms(start_iso, &pms)) {
+      out.event_start_wall_ms = pms;
+    }
+  }
+  if (out.event_start_wall_ms < 0 && out.bucket_epoch_seconds >= 0) {
+    out.event_start_wall_ms = out.bucket_epoch_seconds * 1000;
+  }
+
+  // Prefer Hydration-aligned metadata: slug list responses can omit or lag vs `events?id=`.
+  const std::string event_id = json_scalar_id_string(event, "id");
+  nlohmann::json refreshed_by_id;
+  const nlohmann::json* strike_source = &event;
+  if (!event_id.empty() &&
+      fetch_events_by_id_for_metadata(event_id, &refreshed_by_id, nullptr)) {
+    if (refreshed_by_id.is_array() && !refreshed_by_id.empty() &&
+        refreshed_by_id[0].is_object()) {
+      const auto& ev2 = refreshed_by_id[0];
+      if (ev2.value("slug", std::string{}) == want_slug) {
+        strike_source = &ev2;
+      }
+    }
+  }
+  double ptb = 0.0;
+  std::string ptb_err;
+  if (extract_price_to_beat_from_gamma_event(*strike_source, &ptb, &ptb_err)) {
+    out.price_to_beat = ptb;
+    out.gamma_has_price_to_beat = true;
+    out.strike_from_polymarket_rtds_chainlink = false;
+  } else {
+    // Gamma often omits `eventMetadata` on `/events?slug=` and `/events?id=`; tokens still validate.
+    out.price_to_beat = 0.0;
+    out.gamma_has_price_to_beat = false;
+    out.strike_from_polymarket_rtds_chainlink = false;
+    if (err) {
+      *err = std::move(ptb_err);
+    }
+  }
   return true;
 }
 
@@ -340,20 +551,38 @@ bool discover_btc_updown_5m_for_exact_slug(const std::string& slug,
 }
 
 bool discover_active_btc_updown_5m_via_bucket(BtcFiveMinuteBucketDiscovery& out, std::string* error_message) {
-  const std::int64_t base = current_bucket_epoch_seconds();
+  const std::int64_t now_s = static_cast<std::int64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  const std::int64_t base = (now_s / 300) * 300;
+  // Gamma may briefly lag on the new bucket; avoid accepting base-300 when it is still marked active
+  // after wall clock has entered [base, base+300) — that breaks warmup (shows ended slug) and rollover
+  // (next_epoch already past; rollover guard never sees d2.bucket_epoch >= next_epoch).
   const std::int64_t offsets[3] = {0, 300, -300};
   std::string last_err;
   for (std::int64_t off : offsets) {
     const std::int64_t bucket = base + off;
     const std::string slug = slug_for_bucket(bucket);
     std::string err;
-    if (try_slug(slug, out, &err)) {
+    if (!try_slug(slug, out, &err)) {
+      last_err = std::move(err);
+      continue;
+    }
+    std::int64_t epoch = out.bucket_epoch_seconds;
+    if (epoch < 0 && !parse_bucket_epoch_from_slug(out.confirmed_slug, &epoch)) {
+      last_err = "confirmed slug missing bucket epoch";
+      continue;
+    }
+    if (now_s >= epoch && now_s < epoch + 300) {
+      out.bucket_epoch_seconds = epoch;
       return true;
     }
-    last_err = std::move(err);
+    last_err = "gamma returned active market for " + slug + " but wall clock is outside [epoch, epoch+300)";
   }
   if (error_message) {
-    *error_message = "no confirmed btc-updown-5m market in buckets [base, base+300, base-300]: " + last_err;
+    *error_message =
+        "no btc-updown-5m market matching wall-clock bucket window [epoch, epoch+300): " + last_err;
   }
   return false;
 }
