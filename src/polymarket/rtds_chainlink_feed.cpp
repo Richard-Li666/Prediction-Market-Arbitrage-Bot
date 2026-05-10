@@ -7,11 +7,15 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -22,12 +26,24 @@
 #include <nlohmann/json.hpp>
 
 #include "core/clock.hpp"
+#include "logging/jsonl_writer.hpp"
 
 namespace ll::polymarket {
 
 namespace {
 
 std::once_flag net_once;
+
+/// RTDS `crypto_prices_chainlink` subscription (btc/usd). Sent on every successful `Open` (initial + reconnect).
+static constexpr char kChainlinkSub[] =
+    R"({"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"*","filters":"{\"symbol\":\"btc/usd\"}"}]})";
+
+constexpr int kConnectWaitSec = 30;
+constexpr int kWatchdogPeriodSec = 10;
+/// If we once received ticks but none for this long, assume stalled WS (silent drop / half-open).
+constexpr std::int64_t kStaleTickMs = 120000;
+/// Connection reported open but no parsed ticks (auth/schema/subscription issue).
+constexpr std::int64_t kNoTickAfterOpenMs = 90000;
 
 void ensure_net() {
   std::call_once(net_once, [] { ix::initNetSystem(); });
@@ -205,6 +221,41 @@ void collect_ticks_from_message(const nlohmann::json& j, std::vector<std::pair<s
   one(j);
 }
 
+std::once_flag rtds_err_writer_once;
+std::unique_ptr<ll::logging::JsonlWriter> rtds_err_writer;
+
+/// Appends one JSONL row to `data/errors/rtds_chainlink_errors.jsonl` (or `RTDS_CHAINLINK_ERROR_LOG`) and mirrors to stderr.
+void append_rtds_chainlink_error_jsonl(const nlohmann::json& fields, const std::string& cerr_line) {
+  std::call_once(rtds_err_writer_once, [] {
+    std::string path = "data/errors/rtds_chainlink_errors.jsonl";
+    if (const char* ev = std::getenv("RTDS_CHAINLINK_ERROR_LOG")) {
+      if (ev[0] != '\0') {
+        path = ev;
+      }
+    }
+    try {
+      const std::filesystem::path p(path);
+      if (const auto parent = p.parent_path(); !parent.empty()) {
+        std::filesystem::create_directories(parent);
+      }
+      rtds_err_writer = std::make_unique<ll::logging::JsonlWriter>(std::move(path));
+    } catch (...) {
+    }
+  });
+
+  nlohmann::json row = fields;
+  row["schema_version"] = 1;
+  row["source"] = "rtds_chainlink";
+  row["local_ts_wall_ms"] = ll::core::system_ms();
+  if (rtds_err_writer) {
+    try {
+      rtds_err_writer->append(row);
+    } catch (...) {
+    }
+  }
+  std::cerr << cerr_line << '\n';
+}
+
 }  // namespace
 
 struct RtdsChainlinkFeedImpl {
@@ -217,9 +268,17 @@ struct RtdsChainlinkFeedImpl {
   std::mutex on_tick_mu_;
   std::function<void(std::int64_t, double)> on_tick_;
 
+  std::mutex start_mu_;
   std::atomic<bool> started_{false};
   std::atomic<bool> stop_ping_{false};
   std::atomic<bool> stop_feed_{false};
+
+  std::atomic<std::int64_t> last_tick_wall_ms_{0};
+  std::atomic<std::int64_t> session_start_wall_ms_{0};
+  std::atomic<bool> ever_got_tick_{false};
+
+  std::atomic<bool> watchdog_stop_{false};
+  std::thread watchdog_thr_;
 
   ix::WebSocket ws_;
   std::thread ping_thr_;
@@ -242,6 +301,8 @@ struct RtdsChainlinkFeedImpl {
     if (ticks.empty()) {
       return;
     }
+    ever_got_tick_.store(true, std::memory_order_relaxed);
+    last_tick_wall_ms_.store(ll::core::system_ms(), std::memory_order_relaxed);
     {
       std::lock_guard<std::mutex> lk(buf_mu_);
       for (const auto& pr : ticks) {
@@ -269,14 +330,52 @@ struct RtdsChainlinkFeedImpl {
     }
   }
 
-  void ensure_started_inner(std::string* err) {
-    if (started_.load(std::memory_order_acquire)) {
-      return;
+  bool wait_until_open(std::string* err) {
+    const auto connect_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(kConnectWaitSec);
+    while (std::chrono::steady_clock::now() < connect_deadline &&
+           ws_.getReadyState() != ix::ReadyState::Open) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    ensure_net();
-    ws_.setUrl("wss://ws-live-data.polymarket.com");
+    if (ws_.getReadyState() != ix::ReadyState::Open) {
+      if (err) {
+        *err = "RTDS feed websocket did not open in time";
+      }
+      return false;
+    }
+    return true;
+  }
+
+  void install_ws_handlers() {
     ws_.setOnMessageCallback([this](const ix::WebSocketMessagePtr& msg) {
-      if (!msg || msg->type != ix::WebSocketMessageType::Message) {
+      if (!msg) {
+        return;
+      }
+      if (msg->type == ix::WebSocketMessageType::Open) {
+        ws_.sendText(std::string(kChainlinkSub));
+        return;
+      }
+      if (msg->type == ix::WebSocketMessageType::Close) {
+        nlohmann::json ev;
+        ev["event_type"] = "ws_close";
+        ev["close_code"] = msg->closeInfo.code;
+        ev["close_reason"] = msg->closeInfo.reason;
+        ev["remote"] = msg->closeInfo.remote;
+        const std::string line = std::string("[rtds_chainlink] ws close code=") +
+                                 std::to_string(msg->closeInfo.code) + " reason=" + msg->closeInfo.reason +
+                                 " remote=" + (msg->closeInfo.remote ? "true" : "false");
+        append_rtds_chainlink_error_jsonl(ev, line);
+        return;
+      }
+      if (msg->type == ix::WebSocketMessageType::Error) {
+        nlohmann::json ev;
+        ev["event_type"] = "ws_error";
+        ev["error_reason"] = msg->errorInfo.reason;
+        append_rtds_chainlink_error_jsonl(ev,
+                                          "[rtds_chainlink] ws error reason=" + msg->errorInfo.reason);
+        return;
+      }
+      if (msg->type != ix::WebSocketMessageType::Message) {
         return;
       }
       try {
@@ -287,43 +386,145 @@ struct RtdsChainlinkFeedImpl {
       } catch (...) {
       }
     });
+  }
 
-    ws_.start();
-
-    const auto connect_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (std::chrono::steady_clock::now() < connect_deadline &&
-           ws_.getReadyState() != ix::ReadyState::Open) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-    if (ws_.getReadyState() != ix::ReadyState::Open) {
-      if (err) {
-        *err = "RTDS feed websocket did not open in time";
-      }
-      return;
-    }
-
-    static constexpr char kSub[] =
-        R"({"action":"subscribe","subscriptions":[{"topic":"crypto_prices_chainlink","type":"*","filters":"{\"symbol\":\"btc/usd\"}"}]})";
-    ws_.sendText(kSub);
-
+  void start_ping_worker() {
     stop_ping_.store(false, std::memory_order_relaxed);
     if (ping_thr_.joinable()) {
       ping_thr_.join();
     }
     ping_thr_ = std::thread([this]() { run_ping(); });
+  }
 
+  void reconnect_inner(const char* reason) {
+    std::lock_guard<std::mutex> lk(start_mu_);
+    if (stop_feed_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    if (!started_.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    {
+      nlohmann::json ev;
+      ev["event_type"] = "reconnect";
+      ev["reason"] = reason;
+      append_rtds_chainlink_error_jsonl(ev, std::string("[rtds_chainlink] reconnect: ") + reason);
+    }
+
+    ever_got_tick_.store(false, std::memory_order_relaxed);
+    last_tick_wall_ms_.store(0, std::memory_order_relaxed);
+    session_start_wall_ms_.store(0, std::memory_order_relaxed);
+
+    {
+      std::lock_guard<std::mutex> lk_buf(buf_mu_);
+      buffer_.clear();
+    }
+    cv_.notify_all();
+
+    stop_ping_.store(true, std::memory_order_relaxed);
+    if (ping_thr_.joinable()) {
+      ping_thr_.join();
+    }
+    ws_.stop();
+
+    std::string reopen_err;
+    ws_.start();
+    if (!wait_until_open(&reopen_err)) {
+      nlohmann::json ev;
+      ev["event_type"] = "reconnect_failed";
+      ev["detail"] = reopen_err;
+      append_rtds_chainlink_error_jsonl(ev, "[rtds_chainlink] reconnect failed: " + reopen_err);
+      started_.store(false, std::memory_order_release);
+      return;
+    }
+
+    start_ping_worker();
+    session_start_wall_ms_.store(ll::core::system_ms(), std::memory_order_relaxed);
+  }
+
+  void run_watchdog() {
+    while (!watchdog_stop_.load(std::memory_order_relaxed)) {
+      for (int i = 0; i < kWatchdogPeriodSec * 10; ++i) {
+        if (watchdog_stop_.load(std::memory_order_relaxed)) {
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (!started_.load(std::memory_order_acquire)) {
+        continue;
+      }
+      if (stop_feed_.load(std::memory_order_relaxed)) {
+        continue;
+      }
+
+      const std::int64_t now = ll::core::system_ms();
+      const std::int64_t last = last_tick_wall_ms_.load(std::memory_order_relaxed);
+      const std::int64_t sess = session_start_wall_ms_.load(std::memory_order_relaxed);
+      const bool ever = ever_got_tick_.load(std::memory_order_relaxed);
+
+      const char* why = nullptr;
+      if (ws_.getReadyState() != ix::ReadyState::Open) {
+        why = "ws_not_open";
+      } else if (ever && last > 0 && (now - last) > kStaleTickMs) {
+        why = "stale_ticks";
+      } else if (!ever && sess > 0 && (now - sess) > kNoTickAfterOpenMs) {
+        why = "no_ticks_after_open";
+      }
+      if (why) {
+        reconnect_inner(why);
+      }
+    }
+  }
+
+  void ensure_started_inner(std::string* err) {
+    if (started_.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(start_mu_);
+    if (started_.load(std::memory_order_acquire)) {
+      return;
+    }
+    ensure_net();
+    ws_.setUrl("wss://ws-live-data.polymarket.com");
+    install_ws_handlers();
+
+    ws_.start();
+
+    if (!wait_until_open(err)) {
+      const std::string detail = (err && !err->empty()) ? *err : "RTDS feed websocket did not open in time";
+      nlohmann::json ev;
+      ev["event_type"] = "connect_failed";
+      ev["detail"] = detail;
+      append_rtds_chainlink_error_jsonl(ev, "[rtds_chainlink] connect failed: " + detail);
+      return;
+    }
+
+    start_ping_worker();
+    session_start_wall_ms_.store(ll::core::system_ms(), std::memory_order_relaxed);
     started_.store(true, std::memory_order_release);
+
+    if (!watchdog_thr_.joinable()) {
+      watchdog_stop_.store(false, std::memory_order_relaxed);
+      watchdog_thr_ = std::thread([this]() { run_watchdog(); });
+    }
   }
 
   void stop_inner() {
     stop_feed_.store(true, std::memory_order_relaxed);
+    watchdog_stop_.store(true, std::memory_order_relaxed);
+    if (watchdog_thr_.joinable()) {
+      watchdog_thr_.join();
+    }
     stop_ping_.store(true, std::memory_order_relaxed);
     ws_.stop();
     if (ping_thr_.joinable()) {
       ping_thr_.join();
     }
     started_.store(false, std::memory_order_release);
+    ever_got_tick_.store(false, std::memory_order_relaxed);
+    last_tick_wall_ms_.store(0, std::memory_order_relaxed);
+    session_start_wall_ms_.store(0, std::memory_order_relaxed);
   }
 
   bool wait_strike_inner(std::int64_t boundary_ms, std::int64_t max_skew_ms, std::int64_t timeout_ms,
@@ -408,28 +609,47 @@ struct RtdsChainlinkFeedImpl {
         *error_message = "RTDS btc/usd skew too large (best |dt|=" + std::to_string(sel.best_any_skew) +
                          " ms vs max " + std::to_string(max_skew_ms) + " ms)";
       }
-      std::cerr << "[rtds_chainlink][wait_strike] FAIL skew_too_large"
-                << " target_ms=" << boundary_ms
-                << " now_wall_ms=" << now_wall_ms
-                << " latest_payload_ts_ms=" << latest_payload_ts_ms
-                << " latest_dt_ms=" << latest_dt_ms
-                << " best_any_ts_ms=" << sel.best_any_ts
-                << " best_any_skew_ms=" << sel.best_any_skew
-                << " max_skew_ms=" << max_skew_ms
-                << " timeout_ms=" << timeout_ms
-                << " buf_n=" << snap.size()
-                << "\n";
+      {
+        nlohmann::json ev;
+        ev["event_type"] = "wait_strike_fail";
+        ev["fail_kind"] = "skew_too_large";
+        ev["target_ms"] = boundary_ms;
+        ev["now_wall_ms"] = now_wall_ms;
+        ev["latest_payload_ts_ms"] = latest_payload_ts_ms;
+        ev["latest_dt_ms"] = latest_dt_ms;
+        ev["best_any_ts_ms"] = sel.best_any_ts;
+        ev["best_any_skew_ms"] = sel.best_any_skew;
+        ev["max_skew_ms"] = max_skew_ms;
+        ev["timeout_ms"] = timeout_ms;
+        ev["buf_n"] = snap.size();
+        std::ostringstream oss;
+        oss << "[rtds_chainlink][wait_strike] FAIL skew_too_large"
+            << " target_ms=" << boundary_ms << " now_wall_ms=" << now_wall_ms
+            << " latest_payload_ts_ms=" << latest_payload_ts_ms << " latest_dt_ms=" << latest_dt_ms
+            << " best_any_ts_ms=" << sel.best_any_ts << " best_any_skew_ms=" << sel.best_any_skew
+            << " max_skew_ms=" << max_skew_ms << " timeout_ms=" << timeout_ms << " buf_n=" << snap.size();
+        append_rtds_chainlink_error_jsonl(ev, oss.str());
+      }
     } else if (error_message && error_message->empty()) {
       *error_message = "no RTDS crypto_prices_chainlink btc/usd samples within timeout";
-      std::cerr << "[rtds_chainlink][wait_strike] FAIL no_samples"
-                << " target_ms=" << boundary_ms
-                << " now_wall_ms=" << now_wall_ms
-                << " latest_payload_ts_ms=" << latest_payload_ts_ms
-                << " latest_dt_ms=" << latest_dt_ms
-                << " max_skew_ms=" << max_skew_ms
-                << " timeout_ms=" << timeout_ms
-                << " buf_n=" << snap.size()
-                << "\n";
+      {
+        nlohmann::json ev;
+        ev["event_type"] = "wait_strike_fail";
+        ev["fail_kind"] = "no_samples";
+        ev["target_ms"] = boundary_ms;
+        ev["now_wall_ms"] = now_wall_ms;
+        ev["latest_payload_ts_ms"] = latest_payload_ts_ms;
+        ev["latest_dt_ms"] = latest_dt_ms;
+        ev["max_skew_ms"] = max_skew_ms;
+        ev["timeout_ms"] = timeout_ms;
+        ev["buf_n"] = snap.size();
+        std::ostringstream oss;
+        oss << "[rtds_chainlink][wait_strike] FAIL no_samples"
+            << " target_ms=" << boundary_ms << " now_wall_ms=" << now_wall_ms
+            << " latest_payload_ts_ms=" << latest_payload_ts_ms << " latest_dt_ms=" << latest_dt_ms
+            << " max_skew_ms=" << max_skew_ms << " timeout_ms=" << timeout_ms << " buf_n=" << snap.size();
+        append_rtds_chainlink_error_jsonl(ev, oss.str());
+      }
     }
     return false;
   }
