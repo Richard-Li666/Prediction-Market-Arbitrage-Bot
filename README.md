@@ -56,9 +56,9 @@ Common knobs:
 | `--risk-frac F` | Fraction of cash per entry BUY if `--fixed-spend-usd` not set (default `0.01`) |
 | `--fixed-spend-usd X` | Fixed USDC per BUY (overrides `--risk-frac`; Polymarket min ~ $1) |
 | `--entry X` | BUY when `theo - ask ≥ X` (default `0.15`) |
-| `--close X` | SELL when `|theo - mid| ≤ X` (default `0.005`) |
-| `--lat-ms N` | Simulated execution delay (default **1000** ms for paper; live binary uses **0** by default in §3) |
-| `--fee-rate R` | Polymarket-style taker fee scale (default `0.072`) |
+| `--close X` | SELL when `mid ≥ theo - X` (default `0`, matching `data/backtest.ipynb`) |
+| `--lat-ms N` | Simulated execution delay (default **100** ms for paper, matching `data/backtest.ipynb`; live uses **0**) |
+| `--fee-rate R` | Polymarket-style taker fee scale (default `0.075`, matching `data/backtest.ipynb`) |
 | `--sigma S` | Fallback annualized vol if estimation unavailable |
 | `--sigma-step-ms N` | Resampling step for realized / GARCH input window |
 | `--host` / `--port` / `--stream trade\|bookTicker` | Binance WebSocket (US: **`stream.binance.us`**) |
@@ -185,4 +185,4 @@ $$
 
 *(Vanilla European call reference: $d_1 = d_2 + \sigma\sqrt{T}$, $C = S\mathcal{N}(d_1) - K e^{-rT}\mathcal{N}(d_2)$.)*
 
-**Trading:** **BUY** when **theo − ask ≥ `--entry`** (default **0.15**); pick **UP** vs **DOWN** by larger edge if both qualify. **SELL** when **|theo − mid| ≤ `--close`** (default **0.005**). Paper adds **`--lat-ms`** (default **1000**). See **`apps/btc_poly_runner.cpp`**.
+**Trading:** **BUY** when **theo − ask ≥ `--entry`** (default **0.15**, matching `data/backtest.ipynb`); pick **UP** vs **DOWN** by larger edge if both qualify. **SELL** when **mid ≥ theo − `--close`** (default **0** = notebook rule). Paper adds **`--lat-ms`** (default **100**). Default **σ** path is realized vol (notebook); pass **`--sigma-model garch`** for GARCH. See **`apps/btc_poly_runner.cpp`**.

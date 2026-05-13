@@ -1,6 +1,10 @@
 build/
+build-judge/
 cmake-build-*/
 data/
+.env
+.env.*
+!.env.example
 *.log
 .DS_Store
 compile_commands.json

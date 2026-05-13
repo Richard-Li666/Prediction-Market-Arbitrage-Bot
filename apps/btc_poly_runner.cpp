@@ -395,25 +395,27 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
   }
 
-  // Defaults: align with your ipynb backtest knobs (can override via CLI).
+  // Defaults: align with data/backtest.ipynb cell 5–6 (override via CLI).
   const double r = 0.035;
   const double sigma_min = 0.05;  // guardrail: ignore unrealistically tiny realized sigma
   const double sigma_max = 5.0;   // guardrail: ignore absurd spikes
   double sigma_fallback = 0.15;
   std::int64_t sigma_step_ms = 300;
   /// Prefer GARCH(1,1) via poly_daemon (`arch`) at bucket open; fallback to realized vol on failure.
-  bool sigma_try_garch = true;
+  /// Default false matches data/backtest.ipynb SIGMA_MODE=\"realized\".
+  bool sigma_try_garch = false;
 
   double initial_cash = 100.0;
   double risk_frac = 0.01;
-  double entry = 0.1;       // theo - ask
-  double close_eps = 0.005; // |theo - mid|
+  double entry = 0.15;  // theo - ask; align with data/backtest.ipynb ENTRY_DELTA_EXEC
+  /// SELL when mid >= theo - close_eps (default 0 matches notebook: mid >= theo).
+  double close_eps = 0.0;
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
   double entry_elapsed_min_sec = 250.0;
   double entry_elapsed_max_sec = 290.0;
-  int lat_ms = live_execution ? 0 : 500;
-  double fee_rate = 0.072;
+  int lat_ms = live_execution ? 0 : 100;  // data/backtest.ipynb LAT_MS
+  double fee_rate = 0.075;                // POLY_TAKER_FEE_RATE in backtest.ipynb
   double max_loss_usd = std::numeric_limits<double>::infinity();
   /// If > 0, each entry BUY uses this USDC notional (still capped by affordable cash). Otherwise use --risk-frac.
   double fixed_spend_usd = 0.0;
@@ -527,10 +529,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       std::cerr << "usage: paper_trader --live [options]   |   live_trader --strategy [options]\n"
                    "  --initial-cash X\n"
                    "  --risk-frac F              (default 0.01)\n"
-                   "  --entry X                  (theo-ask; default 0.1)\n"
-                   "  --close X                  (|theo-mid|; default 0.005)\n"
-                   "  --lat-ms N                 (BUY/SELL delay; paper default 500; live default 0)\n"
-                   "  --fee-rate R               (default 0.072)\n"
+                   "  --entry X                  (theo-ask; default 0.15 per backtest.ipynb)\n"
+                   "  --close X                  (SELL when mid >= theo - X; default 0)\n"
+                   "  --lat-ms N                 (BUY/SELL delay; paper default 100 per backtest.ipynb; live 0)\n"
+                   "  --fee-rate R               (default 0.075 per backtest.ipynb)\n"
                    "  --max-loss-usd L           stop opening new BUY when mark-to-market loss >= L\n"
                    "                             (vs --initial-cash baseline; default: no cap)\n"
                    "  --fixed-spend-usd X        each BUY uses X USDC notional (overrides --risk-frac);\n"
@@ -541,7 +543,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
-                   "  --sigma-model garch|realized   (default garch via poly_daemon; fallback realized)\n"
+                   "  --sigma-model garch|realized   (default realized per backtest.ipynb; garch via poly_daemon)\n"
                    "  --spot-feed chainlink|binance   spot price for theo S + vol history (default: chainlink RTDS)\n"
                    "  --host/--port/--parse-workers/--stream ... (binance; only if --spot-feed binance)\n"
                    "  --poly-parse-workers N     (polymarket json parse workers; default 0)\n"
@@ -731,10 +733,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       return;
     }
 
+    // backtest.ipynb: Up -> up_mid >= theo_up; Down -> dn_mid >= theo_dn (optional slack via --close).
     if (paper.side == "Up") {
-      if (std::fabs(p_up - up_mid) > close_eps) return;
+      if (up_mid < p_up - close_eps) return;
     } else {
-      if (std::fabs(p_dn - dn_mid) > close_eps) return;
+      if (dn_mid < p_dn - close_eps) return;
     }
     paper.pending = true;
     paper.pending_action = "SELL";
@@ -855,7 +858,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             }
             std::cerr << "\n";
           }
-          if (now_ns >= paper.cooldown_until_ns) {
+          if (trades_writer.ok()) {
             nlohmann::json row;
             row["schema_version"] = 1;
             row["source"] = src_tag;
@@ -863,19 +866,22 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             row["action"] = "BUY";
             row["slug"] = slug;
             row["side"] = paper.pending_side;
+            row["token_id"] = oi.market_token_id;
             row["error"] = errmsg;
             row["local_ts_wall_ms"] = ll::core::system_ms();
+            row["local_ts_mono_ns"] = now_ns;
             row["theo"] = theo;
             row["ask"] = ask;
             row["edge"] = edge;
             row["qty"] = qty;
             row["spend"] = spend;
             if (daemon_submit_latency_ns >= 0) {
+              row["daemon_submit_latency_ns"] = daemon_submit_latency_ns;
               row["daemon_submit_latency_ms"] = static_cast<double>(daemon_submit_latency_ns) / 1e6;
             }
             trades_writer.append(row);
-            paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
           }
+          paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
           paper.pending = false;
           return;
         }
@@ -956,15 +962,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double dn_mid_ex = 0.5 * (dn_bid + dn_ask);
       const double theo = is_up ? theo_up : theo_dn;
       const double edge = theo - ask;
-      // Match schedule(): only exit when |theo-mid| <= close_eps; re-check at execute time so a stale
-      // pending SELL after lat_ms does not fire if the market has moved (schedule had no re-validation).
+      // Match schedule(): mid >= theo - close_eps; re-check at execute time (backtest.ipynb exit rule).
       if (is_up) {
-        if (std::fabs(theo_up - up_mid_ex) > close_eps) {
+        if (up_mid_ex < theo_up - close_eps) {
           paper.pending = false;
           return;
         }
       } else {
-        if (std::fabs(theo_dn - dn_mid_ex) > close_eps) {
+        if (dn_mid_ex < theo_dn - close_eps) {
           paper.pending = false;
           return;
         }
@@ -987,7 +992,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             }
             std::cerr << "\n";
           }
-          if (now_ns >= paper.cooldown_until_ns) {
+          if (trades_writer.ok()) {
             nlohmann::json row;
             row["schema_version"] = 1;
             row["source"] = src_tag;
@@ -995,15 +1000,18 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             row["action"] = "SELL_BALANCE_QUERY";
             row["slug"] = paper.slug;
             row["side"] = paper.side;
+            row["token_id"] = paper.token_id;
             row["error"] = qerr;
             row["local_ts_wall_ms"] = ll::core::system_ms();
+            row["local_ts_mono_ns"] = now_ns;
             row["strategy_qty"] = strategy_qty;
             if (daemon_query_latency_ns >= 0) {
+              row["daemon_query_latency_ns"] = daemon_query_latency_ns;
               row["daemon_query_latency_ms"] = static_cast<double>(daemon_query_latency_ns) / 1e6;
             }
             trades_writer.append(row);
-            paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
           }
+          paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
           paper.pending = false;
           return;
         }
@@ -1011,11 +1019,33 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       }
 #endif
       if (sell_qty <= 1e-12) {
-        if (live_execution && now_ns >= paper.cooldown_until_ns) {
+        if (live_execution) {
           {
             ll::io::SyncCerrLock _;
             std::cerr << "[live] SELL skipped: strategy_qty=" << strategy_qty << " clob_balance="
                       << clob_balance_shares << " (sell_qty clamped to 0, keeping position for retry)\n";
+          }
+          if (trades_writer.ok()) {
+            nlohmann::json row;
+            row["schema_version"] = 1;
+            row["source"] = src_tag;
+            row["event_type"] = "error";
+            row["action"] = "SELL_SKIPPED_ZERO";
+            row["slug"] = paper.slug;
+            row["side"] = paper.side;
+            row["token_id"] = paper.token_id;
+            row["error"] = "sell_qty clamped to 0 (strategy vs clob balance)";
+            row["local_ts_wall_ms"] = ll::core::system_ms();
+            row["local_ts_mono_ns"] = now_ns;
+            row["strategy_qty"] = strategy_qty;
+            if (std::isfinite(clob_balance_shares)) {
+              row["clob_balance"] = clob_balance_shares;
+            }
+            if (daemon_query_latency_ns >= 0) {
+              row["daemon_query_latency_ns"] = daemon_query_latency_ns;
+              row["daemon_query_latency_ms"] = static_cast<double>(daemon_query_latency_ns) / 1e6;
+            }
+            trades_writer.append(row);
           }
           paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
         }
@@ -1046,7 +1076,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             }
             std::cerr << "\n";
           }
-          if (now_ns >= paper.cooldown_until_ns) {
+          if (trades_writer.ok()) {
             nlohmann::json row;
             row["schema_version"] = 1;
             row["source"] = src_tag;
@@ -1054,8 +1084,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             row["action"] = "SELL";
             row["slug"] = paper.slug;
             row["side"] = paper.side;
+            row["token_id"] = paper.token_id;
             row["error"] = errmsg;
             row["local_ts_wall_ms"] = ll::core::system_ms();
+            row["local_ts_mono_ns"] = now_ns;
             row["theo"] = theo;
             row["bid"] = bid;
             row["edge"] = edge;
@@ -1064,12 +1096,17 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             if (std::isfinite(clob_balance_shares)) {
               row["clob_balance"] = clob_balance_shares;
             }
+            if (daemon_query_latency_ns >= 0) {
+              row["daemon_query_latency_ns"] = daemon_query_latency_ns;
+              row["daemon_query_latency_ms"] = static_cast<double>(daemon_query_latency_ns) / 1e6;
+            }
             if (daemon_submit_latency_ns >= 0) {
+              row["daemon_submit_latency_ns"] = daemon_submit_latency_ns;
               row["daemon_submit_latency_ms"] = static_cast<double>(daemon_submit_latency_ns) / 1e6;
             }
             trades_writer.append(row);
-            paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
           }
+          paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
           paper.pending = false;
           return;
         }
@@ -1284,6 +1321,27 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                   std::cerr << "\n";
                 }
                 balance_query_failed = true;
+                if (trades_writer.ok()) {
+                  const auto wall_ms = ll::core::system_ms();
+                  const auto mono_ns = ll::core::steady_ns();
+                  nlohmann::json row;
+                  row["schema_version"] = 1;
+                  row["source"] = src_tag;
+                  row["event_type"] = "error";
+                  row["action"] = "FORCE_SELL_BALANCE_QUERY";
+                  row["slug"] = paper.slug;
+                  row["side"] = paper.side;
+                  row["token_id"] = paper.token_id;
+                  row["error"] = qerr;
+                  row["local_ts_wall_ms"] = wall_ms;
+                  row["local_ts_mono_ns"] = mono_ns;
+                  row["strategy_qty"] = strategy_qty_fs;
+                  if (daemon_query_latency_fs_ns >= 0) {
+                    row["daemon_query_latency_ns"] = daemon_query_latency_fs_ns;
+                    row["daemon_query_latency_ms"] = static_cast<double>(daemon_query_latency_fs_ns) / 1e6;
+                  }
+                  trades_writer.append(row);
+                }
               } else {
                 sell_qty_fs = std::min(strategy_qty_fs, std::max(0.0, clob_balance_fs));
               }
@@ -1297,6 +1355,28 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                   ll::io::SyncCerrLock _;
                   std::cerr << "[live] FORCE_SELL skipped: strategy_qty=" << strategy_qty_fs << " clob_balance="
                             << clob_balance_fs << " (sell qty clamped to 0)\n";
+                }
+                if (trades_writer.ok()) {
+                  nlohmann::json row;
+                  row["schema_version"] = 1;
+                  row["source"] = src_tag;
+                  row["event_type"] = "error";
+                  row["action"] = "FORCE_SELL_SKIPPED_ZERO";
+                  row["slug"] = paper.slug;
+                  row["side"] = paper.side;
+                  row["token_id"] = paper.token_id;
+                  row["error"] = "sell_qty clamped to 0 at rollover FORCE_SELL";
+                  row["local_ts_wall_ms"] = ll::core::system_ms();
+                  row["local_ts_mono_ns"] = ll::core::steady_ns();
+                  row["strategy_qty"] = strategy_qty_fs;
+                  if (std::isfinite(clob_balance_fs)) {
+                    row["clob_balance"] = clob_balance_fs;
+                  }
+                  if (daemon_query_latency_fs_ns >= 0) {
+                    row["daemon_query_latency_ns"] = daemon_query_latency_fs_ns;
+                    row["daemon_query_latency_ms"] = static_cast<double>(daemon_query_latency_fs_ns) / 1e6;
+                  }
+                  trades_writer.append(row);
                 }
               }
               paper.have_pos = false;
@@ -1332,6 +1412,34 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                     std::cerr << "\n";
                   }
                   live_fs_ok = false;
+                  if (trades_writer.ok()) {
+                    nlohmann::json erow;
+                    erow["schema_version"] = 1;
+                    erow["source"] = src_tag;
+                    erow["event_type"] = "error";
+                    erow["action"] = "FORCE_SELL";
+                    erow["slug"] = paper.slug;
+                    erow["side"] = paper.side;
+                    erow["token_id"] = paper.token_id;
+                    erow["error"] = errmsg;
+                    erow["local_ts_wall_ms"] = ll::core::system_ms();
+                    erow["local_ts_mono_ns"] = ll::core::steady_ns();
+                    erow["bid"] = bid;
+                    erow["strategy_qty"] = strategy_qty_fs;
+                    erow["sell_qty"] = sell_qty_fs;
+                    if (std::isfinite(clob_balance_fs)) {
+                      erow["clob_balance"] = clob_balance_fs;
+                    }
+                    if (daemon_query_latency_fs_ns >= 0) {
+                      erow["daemon_query_latency_ns"] = daemon_query_latency_fs_ns;
+                      erow["daemon_query_latency_ms"] = static_cast<double>(daemon_query_latency_fs_ns) / 1e6;
+                    }
+                    if (daemon_submit_latency_ns >= 0) {
+                      erow["daemon_submit_latency_ns"] = daemon_submit_latency_ns;
+                      erow["daemon_submit_latency_ms"] = static_cast<double>(daemon_submit_latency_ns) / 1e6;
+                    }
+                    trades_writer.append(erow);
+                  }
                 }
               }
 #endif
