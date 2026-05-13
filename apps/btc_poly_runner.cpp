@@ -232,6 +232,9 @@ struct HotState {
   bool have_bin{false};
   double bin_mid{0.0};
   std::int64_t bin_wall_ms{0};
+  /// Local wall at last spot update (Chainlink: ingest `system_ms()`; Binance: tick `local_wall_ms`).
+  /// Used for BUY entry window vs bucket start; `bin_wall_ms` may be Chainlink payload time for theo T.
+  std::int64_t bin_entry_clock_wall_ms{0};
 
   std::deque<std::pair<std::int64_t, double>> bin_hist;
 
@@ -405,6 +408,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double risk_frac = 0.01;
   double entry = 0.1;       // theo - ask
   double close_eps = 0.005; // |theo - mid|
+  /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
+  bool use_entry_elapsed_window = true;
+  double entry_elapsed_min_sec = 250.0;
+  double entry_elapsed_max_sec = 290.0;
   int lat_ms = live_execution ? 0 : 500;
   double fee_rate = 0.072;
   double max_loss_usd = std::numeric_limits<double>::infinity();
@@ -498,6 +505,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         { ll::io::SyncCerrLock _; std::cerr << "--fixed-spend-usd must be >= 0\n"; }
         return 2;
       }
+    } else if (a == "--no-entry-elapsed-window") {
+      use_entry_elapsed_window = false;
+    } else if (a == "--entry-elapsed-min-sec" && i + 1 < argc) {
+      entry_elapsed_min_sec = std::stod(argv[++i]);
+    } else if (a == "--entry-elapsed-max-sec" && i + 1 < argc) {
+      entry_elapsed_max_sec = std::stod(argv[++i]);
     } else if (a == "--poly-token" && i + 1 < argc) {
       poly_discover = false;
       poly_manual_token = argv[++i];
@@ -522,6 +535,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             (vs --initial-cash baseline; default: no cap)\n"
                    "  --fixed-spend-usd X        each BUY uses X USDC notional (overrides --risk-frac);\n"
                    "                             still capped by cash; Polymarket min ~$1 applies\n"
+                   "  --entry-elapsed-min-sec S  (with max; default 250; local wall sec since bucket start,\n"
+                   "                             same idea as backtest.ipynb cell 10 histogram)\n"
+                   "  --entry-elapsed-max-sec S  (default 290; inclusive)\n"
+                   "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
                    "  --sigma-model garch|realized   (default garch via poly_daemon; fallback realized)\n"
@@ -541,6 +558,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       { ll::io::SyncCerrLock _; std::cerr << "unknown arg: " << a << "\n"; }
       return 2;
     }
+  }
+
+  if (use_entry_elapsed_window && entry_elapsed_min_sec > entry_elapsed_max_sec) {
+    { ll::io::SyncCerrLock _; std::cerr << "--entry-elapsed-min-sec must be <= --entry-elapsed-max-sec\n"; }
+    return 2;
   }
 
 #ifndef LL_ENABLE_GARCH_DAEMON
@@ -568,6 +590,15 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   TradeJsonlWriter series_writer(series_path);
   if (series_writer.ok()) {
     { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording series to " << series_writer.path() << " (truncated)\n"; }
+  }
+  {
+    ll::io::SyncCerrLock _;
+    if (use_entry_elapsed_window) {
+      std::cerr << "[" << src_tag << "] BUY entry window (local wall vs bucket): [" << entry_elapsed_min_sec << ", "
+                << entry_elapsed_max_sec << "] s (backtest.ipynb cell 10)\n";
+    } else {
+      std::cerr << "[" << src_tag << "] BUY entry window: disabled\n";
+    }
   }
   std::unique_ptr<TradeJsonlWriter> chainlink_ticks_writer;
   std::atomic<std::uint64_t> chainlink_tick_seq{0};
@@ -658,6 +689,19 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   constexpr std::int64_t kCooldownNs = 10'000'000'000LL;  // 10 seconds
   bool trading_enabled = false;  // skip the very first slug; enable after first rollover
 
+  auto entry_elapsed_ok = [&](std::int64_t active_epoch_sec, std::int64_t entry_clock_wall_ms) -> bool {
+    if (!use_entry_elapsed_window) {
+      return true;
+    }
+    if (active_epoch_sec < 0) {
+      return false;
+    }
+    const std::int64_t bucket_start_ms = active_epoch_sec * 1000;
+    const double elapsed_sec =
+        (static_cast<double>(entry_clock_wall_ms - bucket_start_ms)) / 1000.0;
+    return elapsed_sec >= entry_elapsed_min_sec && elapsed_sec <= entry_elapsed_max_sec;
+  };
+
   auto schedule = [&](double p_up, double p_dn, double up_ask, double up_mid, double dn_ask, double dn_mid) {
     std::lock_guard<std::mutex> lk(paper_mu);
     const auto now_ns = ll::core::steady_ns();
@@ -672,6 +716,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double e_up = p_up - up_ask;
       const double e_dn = p_dn - dn_ask;
       if (e_up < entry && e_dn < entry) return;
+      std::int64_t ae = -1;
+      std::int64_t ecw = 0;
+      {
+        std::lock_guard<std::mutex> hk(hot.mu);
+        ae = hot.active_epoch;
+        ecw = hot.bin_entry_clock_wall_ms;
+      }
+      if (!entry_elapsed_ok(ae, ecw)) return;
       paper.pending = true;
       paper.pending_action = "BUY";
       paper.pending_side = (e_up >= e_dn) ? "Up" : "Down";
@@ -699,6 +751,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     std::string slug;
     std::int64_t active_epoch = -1;
     std::int64_t bin_wall_ms = 0;
+    std::int64_t bin_entry_clock_wall_ms = 0;
     double S = 0.0, K = 0.0;
     bool have_sigma = false;
     double sigma_bucket = 0.0;
@@ -711,6 +764,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       slug = hot.slug;
       active_epoch = hot.active_epoch;
       bin_wall_ms = hot.bin_wall_ms;
+      bin_entry_clock_wall_ms = hot.bin_entry_clock_wall_ms;
       S = hot.bin_mid;
       K = hot.K;
       have_sigma = hot.have_sigma;
@@ -743,6 +797,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double theo = want_up ? theo_up : theo_dn;
       const double edge = theo - ask;
       if (edge < entry) {
+        paper.pending = false;
+        return;
+      }
+      if (!entry_elapsed_ok(active_epoch, bin_entry_clock_wall_ms)) {
         paper.pending = false;
         return;
       }
@@ -1408,6 +1466,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                                          : (ev.type == Event::Type::BinBook)
                                                ? ev.book.local_wall_ms
                                                : ev.trade.local_wall_ms;
+        const std::int64_t entry_clock_wall_ms =
+            (ev.type == Event::Type::ChainlinkSpot) ? ll::core::system_ms() : wall_ms;
         const std::int64_t wall_s = wall_ms / 1000;
 
         bool need_sigma = false;
@@ -1419,6 +1479,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           hot.have_bin = true;
           hot.bin_mid = mid;
           hot.bin_wall_ms = wall_ms;
+          hot.bin_entry_clock_wall_ms = entry_clock_wall_ms;
           hot.bin_hist.emplace_back(wall_ms, mid);
           while (!hot.bin_hist.empty() && hot.bin_hist.front().first < wall_ms - 3600 * 1000) {
             hot.bin_hist.pop_front();
