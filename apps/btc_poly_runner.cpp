@@ -425,8 +425,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double close_eps = 0.0;
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
-  double entry_elapsed_min_sec = 250.0;
-  double entry_elapsed_max_sec = 290.0;
+  double entry_elapsed_min_sec = 260.0;
+  double entry_elapsed_max_sec = 300.0;
   int lat_ms = live_execution ? 0 : 100;  // data/backtest.ipynb LAT_MS
   double fee_rate = 0.075;                // POLY_TAKER_FEE_RATE in backtest.ipynb
   double max_loss_usd = std::numeric_limits<double>::infinity();
@@ -566,9 +566,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             (vs --initial-cash baseline; default: no cap)\n"
                    "  --fixed-spend-usd X        each BUY uses X USDC notional (overrides --risk-frac);\n"
                    "                             still capped by cash; Polymarket min ~$1 applies\n"
-                   "  --entry-elapsed-min-sec S  (with max; default 250; local wall sec since bucket start,\n"
+                   "  --entry-elapsed-min-sec S  (with max; default 260; local wall sec since bucket start,\n"
                    "                             same idea as backtest.ipynb cell 10 histogram)\n"
-                   "  --entry-elapsed-max-sec S  (default 290; inclusive)\n"
+                   "  --entry-elapsed-max-sec S  (default 300; inclusive)\n"
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
