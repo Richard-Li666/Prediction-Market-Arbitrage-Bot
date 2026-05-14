@@ -1,2 +1,0 @@
-/usr/bin/ar qc libll_binance.a CMakeFiles/ll_binance.dir/src/binance/stream_client.cpp.o CMakeFiles/ll_binance.dir/src/binance/stream_env.cpp.o
-/usr/bin/ranlib libll_binance.a

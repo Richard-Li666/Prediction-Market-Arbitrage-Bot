@@ -1,2 +1,0 @@
-/usr/bin/ar qc libll_telemetry.a CMakeFiles/ll_telemetry.dir/src/telemetry/pipeline.cpp.o
-/usr/bin/ranlib libll_telemetry.a
