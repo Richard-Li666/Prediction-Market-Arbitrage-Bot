@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -117,6 +118,18 @@ void load_dotenv(const char* path = ".env") {
 
 std::atomic<bool> g_stop{false};
 void on_sig(int) { g_stop = true; }
+
+/// `q` in [0,1]; `v` sorted ascending (copy).
+static double percentile_sorted_copy(std::vector<std::int64_t> v, double q) {
+  if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+  std::sort(v.begin(), v.end());
+  q = std::max(0.0, std::min(1.0, q));
+  const double pos = q * static_cast<double>(v.size() - 1);
+  const std::size_t i = static_cast<std::size_t>(pos);
+  const std::size_t j = (i + 1 < v.size()) ? i + 1 : i;
+  const double t = pos - static_cast<double>(i);
+  return (1.0 - t) * static_cast<double>(v[i]) + t * static_cast<double>(v[j]);
+}
 
 static size_t curl_write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
   static_cast<std::string*>(ud)->append(ptr, size * nmemb);
@@ -427,6 +440,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   std::size_t poly_parse_workers = 0;
   /// When true, spot `S` + realized-vol history come from Polymarket RTDS Chainlink (`btc/usd`), not Binance.
   bool spot_feed_chainlink = true;
+  /// Consumer-thread spot path timing + queue depth (stderr + periodic summary).
+  bool spot_latency_monitor = false;
+  double spot_latency_report_sec = 5.0;
+  if (const char* slm = std::getenv("LL_SPOT_LATENCY_MONITOR")) {
+    if (slm[0] == '1' || slm[0] == 't' || slm[0] == 'T' || slm[0] == 'y' || slm[0] == 'Y') {
+      spot_latency_monitor = true;
+    }
+  }
 
   ll::binance::StreamClientConfig bin_cfg;
   ll::binance::apply_stream_env_overrides(bin_cfg);
@@ -524,6 +545,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       poly_rollover_web_ptb = true;
     } else if (a == "--disable-rollover-force-sell") {
       disable_rollover_force_sell = true;
+    } else if (a == "--spot-latency-monitor") {
+      spot_latency_monitor = true;
+    } else if (a == "--spot-latency-report-sec" && i + 1 < argc) {
+      spot_latency_report_sec = std::stod(argv[++i]);
+      if (spot_latency_report_sec < 0.25) {
+        { ll::io::SyncCerrLock _; std::cerr << "--spot-latency-report-sec must be >= 0.25\n"; }
+        return 2;
+      }
     } else if (a == "--help") {
       ll::io::SyncCerrLock _;
       std::cerr << "usage: paper_trader --live [options]   |   live_trader --strategy [options]\n"
@@ -554,7 +583,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --poly-rollover-web-ptb    warmup + each rollover: strike from polymarket.com event page\n"
                    "                             first; fallback RTDS Chainlink if fetch fails\n"
                    "  --disable-rollover-force-sell  do not auto FORCE_SELL on rollover\n"
-                   "                               (also env POLY_DISABLE_ROLLOVER_FORCE_SELL=1)\n";
+                   "                               (also env POLY_DISABLE_ROLLOVER_FORCE_SELL=1)\n"
+                   "  --spot-latency-monitor       log spot handler latency + queue depth (stderr)\n"
+                   "                               (also env LL_SPOT_LATENCY_MONITOR=1)\n"
+                   "  --spot-latency-report-sec S  summary interval (default 5)\n";
       return 0;
     } else {
       { ll::io::SyncCerrLock _; std::cerr << "unknown arg: " << a << "\n"; }
@@ -639,6 +671,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     } else {
       std::cerr << "[" << src_tag << "][spot] Polymarket RTDS Chainlink btc/usd for S + vol (no Binance WS)\n";
     }
+    if (spot_latency_monitor) {
+      std::cerr << "[" << src_tag << "] spot_latency_monitor=1 report_sec=" << spot_latency_report_sec
+                << " (LL_SPOT_LATENCY_MONITOR / --spot-latency-monitor)\n";
+    }
   }
 
   std::mutex print_mu;
@@ -664,11 +700,18 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   std::mutex ev_mu;
   std::condition_variable ev_cv;
   std::queue<Event> ev_q;
+  std::atomic<std::uint64_t> ev_q_push_depth_max_window{0};
 
   auto push_event = [&](Event&& e) {
+    std::uint64_t depth_after = 0;
     {
       std::lock_guard<std::mutex> lk(ev_mu);
       ev_q.push(std::move(e));
+      depth_after = static_cast<std::uint64_t>(ev_q.size());
+    }
+    std::uint64_t prev = ev_q_push_depth_max_window.load(std::memory_order_relaxed);
+    while (depth_after > prev &&
+           !ev_q_push_depth_max_window.compare_exchange_weak(prev, depth_after, std::memory_order_relaxed)) {
     }
     ev_cv.notify_one();
   };
@@ -1267,8 +1310,73 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   };
 
   std::thread consumer_thr([&] {
+    std::int64_t spot_lat_report_last_mono_ns = 0;
+    std::vector<std::int64_t> spot_lat_total_ns;
+    std::vector<std::int64_t> spot_lat_sigma_ns;
+    std::vector<std::int64_t> spot_lat_q_rem;
+    const std::int64_t spot_lat_report_period_ns =
+        static_cast<std::int64_t>(spot_latency_report_sec * 1e9);
+    spot_lat_total_ns.reserve(4096);
+    spot_lat_sigma_ns.reserve(4096);
+    spot_lat_q_rem.reserve(4096);
+
+    auto maybe_report_spot_latency = [&]() {
+      if (!spot_latency_monitor) return;
+      const auto now = ll::core::steady_ns();
+      if (spot_lat_report_last_mono_ns == 0) {
+        spot_lat_report_last_mono_ns = now;
+        return;
+      }
+      if (now - spot_lat_report_last_mono_ns < spot_lat_report_period_ns) return;
+      spot_lat_report_last_mono_ns = now;
+
+      const std::uint64_t push_q_max =
+          ev_q_push_depth_max_window.exchange(0, std::memory_order_relaxed);
+
+      const std::size_t n = spot_lat_total_ns.size();
+      if (n == 0) {
+        ll::io::SyncCerrLock _;
+        std::cerr << log_pfx << " spot_latency summary window_sec=" << spot_latency_report_sec
+                  << " samples=0 push_q_max_window=" << push_q_max << "\n";
+        return;
+      }
+
+      std::vector<std::int64_t> tot = spot_lat_total_ns;
+      std::vector<std::int64_t> sig = spot_lat_sigma_ns;
+      std::vector<std::int64_t> qrem = spot_lat_q_rem;
+      spot_lat_total_ns.clear();
+      spot_lat_sigma_ns.clear();
+      spot_lat_q_rem.clear();
+
+      const double tot_p50 = percentile_sorted_copy(tot, 0.50) / 1000.0;
+      const double tot_p95 = percentile_sorted_copy(tot, 0.95) / 1000.0;
+      const double tot_p99 = percentile_sorted_copy(tot, 0.99) / 1000.0;
+      const double tot_max =
+          static_cast<double>(*std::max_element(tot.begin(), tot.end())) / 1000.0;
+
+      const double sig_p50 = percentile_sorted_copy(sig, 0.50) / 1000.0;
+      const double sig_p95 = percentile_sorted_copy(sig, 0.95) / 1000.0;
+      const double sig_p99 = percentile_sorted_copy(sig, 0.99) / 1000.0;
+      const double sig_max =
+          static_cast<double>(*std::max_element(sig.begin(), sig.end())) / 1000.0;
+
+      const double qrem_p50 = percentile_sorted_copy(qrem, 0.50);
+      const double qrem_p99 = percentile_sorted_copy(qrem, 0.99);
+      const double qrem_max =
+          static_cast<double>(*std::max_element(qrem.begin(), qrem.end()));
+
+      ll::io::SyncCerrLock _;
+      std::cerr << log_pfx << " spot_latency summary window_sec=" << spot_latency_report_sec
+                << " samples=" << n << " push_q_max_window=" << push_q_max
+                << " q_rem_p50=" << qrem_p50 << " q_rem_p99=" << qrem_p99 << " q_rem_max=" << qrem_max
+                << " spot_total_us p50=" << tot_p50 << " p95=" << tot_p95 << " p99=" << tot_p99
+                << " max=" << tot_max << " | sigma_path_us p50=" << sig_p50 << " p95=" << sig_p95
+                << " p99=" << sig_p99 << " max=" << sig_max << "\n";
+    };
+
     for (;;) {
       Event ev;
+      std::size_t q_rem = 0;
       {
         std::unique_lock<std::mutex> lk(ev_mu);
         ev_cv.wait(lk, [&] { return g_stop.load(std::memory_order_relaxed) || !ev_q.empty(); });
@@ -1277,7 +1385,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         }
         ev = std::move(ev_q.front());
         ev_q.pop();
+        q_rem = ev_q.size();
       }
+
+      maybe_report_spot_latency();
 
       if (ev.type == Event::Type::Stop) {
         return;
@@ -1551,6 +1662,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
 
       if (ev.type == Event::Type::ChainlinkSpot || ev.type == Event::Type::BinBook ||
           ev.type == Event::Type::BinTrade) {
+        const std::int64_t t_spot_begin =
+            spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
         if (ev.type == Event::Type::ChainlinkSpot && chainlink_ticks_writer &&
             chainlink_ticks_writer->ok()) {
           const auto n = chainlink_tick_seq.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1580,6 +1693,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             (ev.type == Event::Type::ChainlinkSpot) ? ll::core::system_ms() : wall_ms;
         const std::int64_t wall_s = wall_ms / 1000;
 
+        const std::int64_t t_sigma_begin =
+            spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
         bool need_sigma = false;
         bool have_full_hour = false;
         std::vector<double> resampled_mids;
@@ -1720,7 +1835,23 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           }
         }
 
+        const std::int64_t t_sigma_end =
+            spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
         on_hot_update();
+        const std::int64_t t_spot_end =
+            spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
+        if (spot_latency_monitor) {
+          spot_lat_total_ns.push_back(t_spot_end - t_spot_begin);
+          spot_lat_sigma_ns.push_back(t_sigma_end - t_sigma_begin);
+          spot_lat_q_rem.push_back(static_cast<std::int64_t>(q_rem));
+          constexpr std::size_t kSpotLatCap = 16384;
+          if (spot_lat_total_ns.size() > kSpotLatCap) {
+            const auto drop = static_cast<std::ptrdiff_t>(kSpotLatCap / 2);
+            spot_lat_total_ns.erase(spot_lat_total_ns.begin(), spot_lat_total_ns.begin() + drop);
+            spot_lat_sigma_ns.erase(spot_lat_sigma_ns.begin(), spot_lat_sigma_ns.begin() + drop);
+            spot_lat_q_rem.erase(spot_lat_q_rem.begin(), spot_lat_q_rem.begin() + drop);
+          }
+        }
         continue;
       }
 
