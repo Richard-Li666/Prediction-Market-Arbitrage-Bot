@@ -1,5 +1,6 @@
 build/
-build-judge/
+# CMake out-of-tree presets: build-dbg, build-jthread, build-tsan, build-asan, ...
+build-*/
 cmake-build-*/
 data/
 .env

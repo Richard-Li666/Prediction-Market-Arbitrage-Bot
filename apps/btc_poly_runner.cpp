@@ -1015,15 +1015,16 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           paper.pending = false;
           return;
         }
-        sell_qty = std::min(strategy_qty, std::max(0.0, clob_balance_shares));
+        // Live SELL size: use CLOB conditional balance only (do not cap by strategy_qty).
+        sell_qty = std::max(0.0, clob_balance_shares);
       }
 #endif
       if (sell_qty <= 1e-12) {
         if (live_execution) {
           {
             ll::io::SyncCerrLock _;
-            std::cerr << "[live] SELL skipped: strategy_qty=" << strategy_qty << " clob_balance="
-                      << clob_balance_shares << " (sell_qty clamped to 0, keeping position for retry)\n";
+            std::cerr << "[live] SELL skipped: clob_balance=" << clob_balance_shares
+                      << " (API reported 0 or negative sellable shares; keeping position for retry)\n";
           }
           if (trades_writer.ok()) {
             nlohmann::json row;
@@ -1034,7 +1035,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             row["slug"] = paper.slug;
             row["side"] = paper.side;
             row["token_id"] = paper.token_id;
-            row["error"] = "sell_qty clamped to 0 (strategy vs clob balance)";
+            row["error"] = "sell_qty from API balance is 0";
             row["local_ts_wall_ms"] = ll::core::system_ms();
             row["local_ts_mono_ns"] = now_ns;
             row["strategy_qty"] = strategy_qty;
@@ -1343,7 +1344,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                   trades_writer.append(row);
                 }
               } else {
-                sell_qty_fs = std::min(strategy_qty_fs, std::max(0.0, clob_balance_fs));
+                // FORCE_SELL size: CLOB balance only (do not cap by strategy_qty).
+                sell_qty_fs = std::max(0.0, clob_balance_fs);
               }
             }
 #endif
@@ -1353,8 +1355,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
               if (live_execution) {
                 {
                   ll::io::SyncCerrLock _;
-                  std::cerr << "[live] FORCE_SELL skipped: strategy_qty=" << strategy_qty_fs << " clob_balance="
-                            << clob_balance_fs << " (sell qty clamped to 0)\n";
+                  std::cerr << "[live] FORCE_SELL skipped: clob_balance=" << clob_balance_fs
+                            << " (API reported 0 sellable shares)\n";
                 }
                 if (trades_writer.ok()) {
                   nlohmann::json row;
@@ -1365,7 +1367,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                   row["slug"] = paper.slug;
                   row["side"] = paper.side;
                   row["token_id"] = paper.token_id;
-                  row["error"] = "sell_qty clamped to 0 at rollover FORCE_SELL";
+                  row["error"] = "sell_qty from API balance is 0 at rollover FORCE_SELL";
                   row["local_ts_wall_ms"] = ll::core::system_ms();
                   row["local_ts_mono_ns"] = ll::core::steady_ns();
                   row["strategy_qty"] = strategy_qty_fs;
@@ -1646,7 +1648,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
               for (double x : rets) mean += x;
               mean /= static_cast<double>(rets.size());
               double var = 0.0;
-              for (double x : rets) { double d = x - mean; var += d * d; }
+              for (double x : rets) {
+                double d = x - mean;
+                var += d * d;
+              }
               var /= static_cast<double>(rets.size() - 1);
               const double steps_per_year =
                   (365.0 * 24.0 * 3600.0 * 1000.0) / static_cast<double>(sigma_step_ms);
@@ -1668,6 +1673,51 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           std::lock_guard<std::mutex> lk(hot.mu);
           hot.have_sigma = false;
           hot.sigma_bucket = 0.0;
+        }
+
+        // Rolling realized σ every spot tick (data/backtest.ipynb), after optional first-time GARCH path.
+        {
+          bool in_bucket = false;
+          bool rv_full_hour = false;
+          std::vector<double> rv_mids;
+          {
+            std::lock_guard<std::mutex> lk(hot.mu);
+            in_bucket = hot.active_epoch >= 0 && wall_s >= hot.active_epoch;
+            if (in_bucket) {
+              rv_full_hour =
+                  !hot.bin_hist.empty() && (wall_ms - hot.bin_hist.front().first >= 3600 * 1000);
+              if (rv_full_hour) {
+                rv_mids = resample_mids_from_hist(hot.bin_hist, wall_ms, sigma_step_ms);
+              }
+            }
+          }
+          if (in_bucket && rv_full_hour && rv_mids.size() >= 10) {
+            std::vector<double> rets;
+            rets.reserve(rv_mids.size() - 1);
+            for (std::size_t ri = 1; ri < rv_mids.size(); ++ri) {
+              const double lr = std::log(rv_mids[ri] / rv_mids[ri - 1]);
+              if (std::isfinite(lr)) rets.push_back(lr);
+            }
+            if (rets.size() >= 10) {
+              double mean = 0.0;
+              for (double x : rets) mean += x;
+              mean /= static_cast<double>(rets.size());
+              double var = 0.0;
+              for (double x : rets) {
+                double d = x - mean;
+                var += d * d;
+              }
+              var /= static_cast<double>(rets.size() - 1);
+              const double steps_per_year =
+                  (365.0 * 24.0 * 3600.0 * 1000.0) / static_cast<double>(sigma_step_ms);
+              const double rv_sig = std::sqrt(var * steps_per_year);
+              if (std::isfinite(rv_sig) && rv_sig >= sigma_min && rv_sig <= sigma_max) {
+                std::lock_guard<std::mutex> lk(hot.mu);
+                hot.have_sigma = true;
+                hot.sigma_bucket = rv_sig;
+              }
+            }
+          }
         }
 
         on_hot_update();
