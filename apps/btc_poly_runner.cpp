@@ -426,7 +426,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
   double entry_elapsed_min_sec = 260.0;
-  double entry_elapsed_max_sec = 300.0;
+  double entry_elapsed_max_sec = 298.0;
   int lat_ms = live_execution ? 0 : 100;  // data/backtest.ipynb LAT_MS
   double fee_rate = 0.075;                // POLY_TAKER_FEE_RATE in backtest.ipynb
   double max_loss_usd = std::numeric_limits<double>::infinity();
