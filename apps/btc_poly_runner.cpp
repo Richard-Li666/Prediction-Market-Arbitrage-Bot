@@ -432,6 +432,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double max_loss_usd = std::numeric_limits<double>::infinity();
   /// If > 0, each entry BUY uses this USDC notional (still capped by affordable cash). Otherwise use --risk-frac.
   double fixed_spend_usd = 0.0;
+  /// BUY only when chosen outcome's best ask is in [buy_ask_min, buy_ask_max] (default [0, 0.2]; ask must be > 0).
+  bool use_buy_ask_range = true;
+  double buy_ask_min = 0.0;
+  double buy_ask_max = 0.2;
 
   bool poly_discover = true;
   bool poly_rollover_web_ptb = false;
@@ -534,6 +538,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       entry_elapsed_min_sec = std::stod(argv[++i]);
     } else if (a == "--entry-elapsed-max-sec" && i + 1 < argc) {
       entry_elapsed_max_sec = std::stod(argv[++i]);
+    } else if (a == "--buy-ask-min" && i + 1 < argc) {
+      buy_ask_min = std::stod(argv[++i]);
+    } else if (a == "--buy-ask-max" && i + 1 < argc) {
+      buy_ask_max = std::stod(argv[++i]);
+    } else if (a == "--no-buy-ask-range") {
+      use_buy_ask_range = false;
     } else if (a == "--poly-token" && i + 1 < argc) {
       poly_discover = false;
       poly_manual_token = argv[++i];
@@ -570,6 +580,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             same idea as backtest.ipynb cell 10 histogram)\n"
                    "  --entry-elapsed-max-sec S  (default 300; inclusive)\n"
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
+                   "  --buy-ask-min P            (with max; default 0; BUY only if best ask in [min, max])\n"
+                   "  --buy-ask-max P            (default 0.2)\n"
+                   "  --no-buy-ask-range         allow BUY at any ask (restores min-ask 0.02 guard only)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
                    "  --sigma-model garch|realized   (default realized per backtest.ipynb; garch via poly_daemon)\n"
@@ -597,6 +610,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   if (use_entry_elapsed_window && entry_elapsed_min_sec > entry_elapsed_max_sec) {
     { ll::io::SyncCerrLock _; std::cerr << "--entry-elapsed-min-sec must be <= --entry-elapsed-max-sec\n"; }
     return 2;
+  }
+
+  if (use_buy_ask_range) {
+    if (!std::isfinite(buy_ask_min) || !std::isfinite(buy_ask_max) || buy_ask_min < 0.0 || buy_ask_max > 1.0 ||
+        buy_ask_min > buy_ask_max) {
+      { ll::io::SyncCerrLock _; std::cerr << "--buy-ask-min/--buy-ask-max invalid (expect 0<=min<=max<=1)\n"; }
+      return 2;
+    }
   }
 
 #ifndef LL_ENABLE_GARCH_DAEMON
@@ -632,6 +653,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                 << entry_elapsed_max_sec << "] s (backtest.ipynb cell 10)\n";
     } else {
       std::cerr << "[" << src_tag << "] BUY entry window: disabled\n";
+    }
+    if (use_buy_ask_range) {
+      std::cerr << "[" << src_tag << "] BUY ask range: [" << buy_ask_min << ", " << buy_ask_max << "] (ask>0)\n";
+    } else {
+      std::cerr << "[" << src_tag << "] BUY ask range: disabled (min ask 0.02 for entry)\n";
     }
   }
   std::unique_ptr<TradeJsonlWriter> chainlink_ticks_writer;
@@ -760,7 +786,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       }
       const double e_up = p_up - up_ask;
       const double e_dn = p_dn - dn_ask;
-      if (e_up < entry && e_dn < entry) return;
+      auto buy_ask_ok = [&](double ask) -> bool {
+        if (!std::isfinite(ask) || ask <= 0.0) return false;
+        if (use_buy_ask_range) return ask >= buy_ask_min && ask <= buy_ask_max;
+        return ask >= 0.02;
+      };
+      const bool up_ok = (e_up >= entry) && buy_ask_ok(up_ask);
+      const bool dn_ok = (e_dn >= entry) && buy_ask_ok(dn_ask);
+      if (!up_ok && !dn_ok) return;
       std::int64_t ae = -1;
       std::int64_t ecw = 0;
       {
@@ -771,7 +804,13 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       if (!entry_elapsed_ok(ae, ecw)) return;
       paper.pending = true;
       paper.pending_action = "BUY";
-      paper.pending_side = (e_up >= e_dn) ? "Up" : "Down";
+      if (up_ok && dn_ok) {
+        paper.pending_side = (e_up >= e_dn) ? "Up" : "Down";
+      } else if (up_ok) {
+        paper.pending_side = "Up";
+      } else {
+        paper.pending_side = "Down";
+      }
       paper.due_ns = now_ns + lat_ns;
       return;
     }
@@ -850,7 +889,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         paper.pending = false;
         return;
       }
-      if (ask < 0.02) {
+      if (use_buy_ask_range) {
+        if (!std::isfinite(ask) || ask <= 0.0 || ask < buy_ask_min || ask > buy_ask_max) {
+          paper.pending = false;
+          return;
+        }
+      } else if (ask < 0.02) {
         paper.pending = false;
         return;
       }
