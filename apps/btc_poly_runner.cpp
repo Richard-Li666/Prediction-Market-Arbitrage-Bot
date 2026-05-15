@@ -237,6 +237,16 @@ class TradeJsonlWriter {
   std::mutex mu_;
 };
 
+/// 每次进程启动清空会话 jsonl（避免上次 open 失败等原因留下旧内容）。
+void reset_session_jsonl_file(const std::string& path) {
+  std::error_code ec;
+  const std::filesystem::path p(path);
+  if (p.has_parent_path()) {
+    std::filesystem::create_directories(p.parent_path(), ec);
+  }
+  std::filesystem::remove(p, ec);
+}
+
 struct HotState {
   std::mutex mu;
   std::int64_t active_epoch{-1};
@@ -447,6 +457,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double buy_ask_min = 0.0;
   double buy_ask_max = 1.0;
 
+  /// When true: BUY the opposite outcome of the edge signal; SELL uses the other side's theo floor vs this side's bid.
+  bool invert_outcomes = false;
+
   bool poly_discover = true;
   bool poly_rollover_web_ptb = false;
   std::string poly_manual_token;
@@ -577,6 +590,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       poly_rollover_web_ptb = true;
     } else if (a == "--disable-rollover-force-sell") {
       disable_rollover_force_sell = true;
+    } else if (a == "--invert-outcomes") {
+      invert_outcomes = true;
     } else if (a == "--spot-latency-monitor") {
       spot_latency_monitor = true;
     } else if (a == "--spot-latency-report-sec" && i + 1 < argc) {
@@ -614,7 +629,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --spot-feed chainlink|binance   spot price for theo S + vol history (default: chainlink RTDS)\n"
                    "  --host/--port/--parse-workers/--stream ... (binance; only if --spot-feed binance)\n"
                    "  --poly-parse-workers N     (polymarket json parse workers; default 0)\n"
-                   "  --out-prefix NAME          (under data/: *_trades.jsonl, *_series.jsonl;\n"
+                   "  --out-prefix NAME          (under data/: *_trades.jsonl, *_series.jsonl; each process start\n"
+                   "                             deletes+recreates those files for a fresh session;\n"
                    "                             with --spot-feed chainlink also *_chainlink.jsonl ticks)\n"
                    "  --poly-token TOKEN         (manual fixed token; pair with --poly-event-slug; dual WS)\n"
                    "  --poly-event-slug SLUG     required with --poly-token (Gamma btc-updown-5m-<epoch> slug)\n"
@@ -622,6 +638,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             first; fallback RTDS Chainlink if fetch fails\n"
                    "  --disable-rollover-force-sell  do not auto FORCE_SELL on rollover\n"
                    "                               (also env POLY_DISABLE_ROLLOVER_FORCE_SELL=1)\n"
+                   "  --invert-outcomes          BUY Down when edge chose Up (and vice versa);\n"
+                   "                             SELL: compare held side bid vs the OTHER side's theo floor\n"
                    "  --spot-latency-monitor       log spot handler latency + queue depth (stderr)\n"
                    "                               (also env LL_SPOT_LATENCY_MONITOR=1)\n"
                    "  --spot-latency-report-sec S  summary interval (default 5)\n";
@@ -663,16 +681,20 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
   }
 
-  // Always record live trades/series locally (truncate on start).
+  // 每次启动只保留本会话：先删旧文件再 trunc 打开（trades / series / chainlink ticks）。
   const std::string trades_path = "data/" + out_prefix + "_trades.jsonl";
   const std::string series_path = "data/" + out_prefix + "_series.jsonl";
+  reset_session_jsonl_file(trades_path);
+  reset_session_jsonl_file(series_path);
   TradeJsonlWriter trades_writer(trades_path);
   if (trades_writer.ok()) {
-    { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording trades to " << trades_writer.path() << " (truncated)\n"; }
+    { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording trades to " << trades_writer.path()
+                                        << " (fresh session)\n"; }
   }
   TradeJsonlWriter series_writer(series_path);
   if (series_writer.ok()) {
-    { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording series to " << series_writer.path() << " (truncated)\n"; }
+    { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording series to " << series_writer.path()
+                                        << " (fresh session)\n"; }
   }
   {
     ll::io::SyncCerrLock _;
@@ -693,6 +715,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     } else {
       std::cerr << "[" << src_tag << "] BUY edge persist: off\n";
     }
+    if (invert_outcomes) {
+      std::cerr << "[" << src_tag << "] --invert-outcomes: BUY opposite of edge signal; SELL uses other side theo floor\n";
+    }
     std::cerr << "[" << src_tag << "] SELL when bid >= theo - close_eps - close_early_threshold"
               << " (close_eps=" << close_eps << " close_early_threshold=" << close_early_threshold << ")\n";
   }
@@ -700,9 +725,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   std::atomic<std::uint64_t> chainlink_tick_seq{0};
   if (spot_feed_chainlink) {
     const std::string cl_path = "data/" + out_prefix + "_chainlink.jsonl";
+    reset_session_jsonl_file(cl_path);
     chainlink_ticks_writer = std::make_unique<TradeJsonlWriter>(cl_path);
     if (chainlink_ticks_writer->ok()) {
-      { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording Chainlink ticks to " << chainlink_ticks_writer->path() << " (truncated)\n"; }
+      { ll::io::SyncCerrLock _; std::cerr << "[" << src_tag << "] recording Chainlink ticks to "
+                                          << chainlink_ticks_writer->path() << " (fresh session)\n"; }
     }
   }
   std::int64_t last_series_mono_ns = 0;
@@ -902,6 +929,13 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         ecw = hot.bin_entry_clock_wall_ms;
       }
       if (!entry_elapsed_ok(ae, ecw)) return;
+      if (invert_outcomes) {
+        if (paper.pending_side == "Up") {
+          paper.pending_side = "Down";
+        } else if (paper.pending_side == "Down") {
+          paper.pending_side = "Up";
+        }
+      }
       paper.pending = true;
       paper.pending_action = "BUY";
       if (up_ok && dn_ok) {
@@ -918,10 +952,18 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     // backtest.ipynb: Up -> up_bid >= theo_up; Down -> dn_bid >= theo_dn (--close / --close-early-threshold).
     const double close_floor_up = p_up - close_eps - close_early_threshold;
     const double close_floor_dn = p_dn - close_eps - close_early_threshold;
-    if (paper.side == "Up") {
-      if (up_bid < close_floor_up) return;
+    if (invert_outcomes) {
+      if (paper.side == "Up") {
+        if (up_bid < close_floor_dn) return;
+      } else {
+        if (dn_bid < close_floor_up) return;
+      }
     } else {
-      if (dn_bid < close_floor_dn) return;
+      if (paper.side == "Up") {
+        if (up_bid < close_floor_up) return;
+      } else {
+        if (dn_bid < close_floor_dn) return;
+      }
     }
     paper.pending = true;
     paper.pending_action = "SELL";
@@ -1151,16 +1193,30 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double dn_mid_ex = 0.5 * (dn_bid + dn_ask);
       const double theo = is_up ? theo_up : theo_dn;
       const double edge = theo - ask;
-      // Match schedule(): bid >= theo - close_eps - close_early_threshold.
-      if (is_up) {
-        if (up_bid < theo_up - close_eps - close_early_threshold) {
-          paper.pending = false;
-          return;
+      // Match schedule(): bid >= theo - close_eps - close_early_threshold (or swapped floors if --invert-outcomes).
+      if (invert_outcomes) {
+        if (is_up) {
+          if (up_bid < theo_dn - close_eps - close_early_threshold) {
+            paper.pending = false;
+            return;
+          }
+        } else {
+          if (dn_bid < theo_up - close_eps - close_early_threshold) {
+            paper.pending = false;
+            return;
+          }
         }
       } else {
-        if (dn_bid < theo_dn - close_eps - close_early_threshold) {
-          paper.pending = false;
-          return;
+        if (is_up) {
+          if (up_bid < theo_up - close_eps - close_early_threshold) {
+            paper.pending = false;
+            return;
+          }
+        } else {
+          if (dn_bid < theo_dn - close_eps - close_early_threshold) {
+            paper.pending = false;
+            return;
+          }
         }
       }
       const double strategy_qty = paper.qty;

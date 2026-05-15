@@ -2,6 +2,7 @@ build/
 # CMake out-of-tree presets: build-dbg, build-jthread, build-tsan, build-asan, ...
 build-*/
 build_fresh/
+_build_check/
 cmake-build-*/
 data/
 .env
