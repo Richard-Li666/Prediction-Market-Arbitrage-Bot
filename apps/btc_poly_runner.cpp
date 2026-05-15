@@ -264,6 +264,11 @@ struct HotState {
   bool have_down{false};
   double down_bid{0.0};
   double down_ask{0.0};
+
+  /// Mono time when `theo-ask >= entry` (Up) or `theo-ask >= entry` (Down) first became true; -1 if not armed.
+  /// Aligns with `data/real_backtest.ipynb` EDGE_PERSIST_MS (continuous edge in steady time).
+  std::int64_t edge_up_ok_since_mono_ns{-1};
+  std::int64_t edge_dn_ok_since_mono_ns{-1};
 };
 
 static inline double clamp01(double x) { return (x < 0.0) ? 0.0 : (x > 1.0 ? 1.0 : x); }
@@ -425,8 +430,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double close_eps = 0.0;
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
-  double entry_elapsed_min_sec = 260.0;
+  double entry_elapsed_min_sec = 250.0;
   double entry_elapsed_max_sec = 298.0;
+  /// BUY: `theo-ask >= entry` must hold continuously for this many ms (steady clock); 0 = off (legacy).
+  /// Matches `data/real_backtest.ipynb` EDGE_PERSIST_MS.
+  int edge_persist_ms = 1000;
   int lat_ms = live_execution ? 0 : 100;  // data/backtest.ipynb LAT_MS
   double fee_rate = 0.075;                // POLY_TAKER_FEE_RATE in backtest.ipynb
   double max_loss_usd = std::numeric_limits<double>::infinity();
@@ -538,6 +546,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       entry_elapsed_min_sec = std::stod(argv[++i]);
     } else if (a == "--entry-elapsed-max-sec" && i + 1 < argc) {
       entry_elapsed_max_sec = std::stod(argv[++i]);
+    } else if (a == "--edge-persist-ms" && i + 1 < argc) {
+      edge_persist_ms = std::stoi(argv[++i]);
+      if (edge_persist_ms < 0) {
+        { ll::io::SyncCerrLock _; std::cerr << "--edge-persist-ms must be >= 0 (0 disables)\n"; }
+        return 2;
+      }
     } else if (a == "--buy-ask-min" && i + 1 < argc) {
       buy_ask_min = std::stod(argv[++i]);
     } else if (a == "--buy-ask-max" && i + 1 < argc) {
@@ -576,9 +590,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             (vs --initial-cash baseline; default: no cap)\n"
                    "  --fixed-spend-usd X        each BUY uses X USDC notional (overrides --risk-frac);\n"
                    "                             still capped by cash; Polymarket min ~$1 applies\n"
-                   "  --entry-elapsed-min-sec S  (with max; default 260; local wall sec since bucket start,\n"
+                   "  --entry-elapsed-min-sec S  (with max; default 250; local wall sec since bucket start,\n"
                    "                             same idea as backtest.ipynb cell 10 histogram)\n"
-                   "  --entry-elapsed-max-sec S  (default 300; inclusive)\n"
+                   "  --entry-elapsed-max-sec S  (default 298; inclusive)\n"
+                   "  --edge-persist-ms N        BUY: theo-ask>=entry must hold N ms steady time (default 1000;\n"
+                   "                             0 off). Matches data/real_backtest.ipynb EDGE_PERSIST_MS.\n"
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
                    "  --buy-ask-min P            (with max; default 0; BUY only if best ask in [min, max])\n"
                    "  --buy-ask-max P            (default 0.2)\n"
@@ -620,6 +636,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
   }
 
+  const std::int64_t edge_persist_ns =
+      edge_persist_ms > 0 ? static_cast<std::int64_t>(edge_persist_ms) * 1'000'000LL : 0LL;
+
 #ifndef LL_ENABLE_GARCH_DAEMON
   if (sigma_try_garch) {
     ll::io::SyncCerrLock _;
@@ -658,6 +677,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       std::cerr << "[" << src_tag << "] BUY ask range: [" << buy_ask_min << ", " << buy_ask_max << "] (ask>0)\n";
     } else {
       std::cerr << "[" << src_tag << "] BUY ask range: disabled (min ask 0.02 for entry)\n";
+    }
+    if (edge_persist_ns > 0) {
+      std::cerr << "[" << src_tag << "] BUY edge persist: " << edge_persist_ms
+                << " ms steady (real_backtest.ipynb EDGE_PERSIST_MS)\n";
+    } else {
+      std::cerr << "[" << src_tag << "] BUY edge persist: off\n";
     }
   }
   std::unique_ptr<TradeJsonlWriter> chainlink_ticks_writer;
@@ -780,8 +805,17 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     if (paper.pending) return;
     if (paper.risk_stop) return;
 
+    if (paper.have_pos) {
+      std::lock_guard<std::mutex> hk(hot.mu);
+      hot.edge_up_ok_since_mono_ns = -1;
+      hot.edge_dn_ok_since_mono_ns = -1;
+    }
+
     if (!paper.have_pos) {
       if (!trading_enabled) {
+        std::lock_guard<std::mutex> hk(hot.mu);
+        hot.edge_up_ok_since_mono_ns = -1;
+        hot.edge_dn_ok_since_mono_ns = -1;
         return;
       }
       const double e_up = p_up - up_ask;
@@ -791,8 +825,30 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         if (use_buy_ask_range) return ask >= buy_ask_min && ask <= buy_ask_max;
         return ask >= 0.02;
       };
-      const bool up_ok = (e_up >= entry) && buy_ask_ok(up_ask);
-      const bool dn_ok = (e_dn >= entry) && buy_ask_ok(dn_ask);
+      const bool edge_up_raw = (e_up >= entry) && buy_ask_ok(up_ask);
+      const bool edge_dn_raw = (e_dn >= entry) && buy_ask_ok(dn_ask);
+
+      bool up_ok = false;
+      bool dn_ok = false;
+      {
+        std::lock_guard<std::mutex> hk(hot.mu);
+        if (edge_up_raw) {
+          if (hot.edge_up_ok_since_mono_ns < 0) hot.edge_up_ok_since_mono_ns = now_ns;
+        } else {
+          hot.edge_up_ok_since_mono_ns = -1;
+        }
+        if (edge_dn_raw) {
+          if (hot.edge_dn_ok_since_mono_ns < 0) hot.edge_dn_ok_since_mono_ns = now_ns;
+        } else {
+          hot.edge_dn_ok_since_mono_ns = -1;
+        }
+        if (edge_up_raw && (edge_persist_ns <= 0LL || (now_ns - hot.edge_up_ok_since_mono_ns) >= edge_persist_ns)) {
+          up_ok = true;
+        }
+        if (edge_dn_raw && (edge_persist_ns <= 0LL || (now_ns - hot.edge_dn_ok_since_mono_ns) >= edge_persist_ns)) {
+          dn_ok = true;
+        }
+      }
       if (!up_ok && !dn_ok) return;
       std::int64_t ae = -1;
       std::int64_t ecw = 0;
@@ -1696,6 +1752,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           }
           hot.have_sigma = false;
           hot.sigma_bucket = 0.0;
+          hot.edge_up_ok_since_mono_ns = -1;
+          hot.edge_dn_ok_since_mono_ns = -1;
         }
         {
           std::lock_guard<std::mutex> lk(paper_mu);
@@ -1914,6 +1972,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           if (ev.quote.market_bucket_epoch >= 0 && hot.active_epoch < 0) {
             hot.active_epoch = ev.quote.market_bucket_epoch;
             hot.slug = ev.quote.event_slug;
+            hot.edge_up_ok_since_mono_ns = -1;
+            hot.edge_dn_ok_since_mono_ns = -1;
           }
         }
         on_hot_update();
