@@ -443,7 +443,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
   double entry_elapsed_min_sec = 250.0;
-  double entry_elapsed_max_sec = 298.0;
+  double entry_elapsed_max_sec = 300.0;
   /// BUY: `theo-ask >= entry` must hold continuously for this many ms (steady clock); 0 = off (legacy).
   /// Matches `data/real_backtest.ipynb` EDGE_PERSIST_MS.
   int edge_persist_ms = 1000;
@@ -611,7 +611,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             still capped by cash; Polymarket min ~$1 applies\n"
                    "  --entry-elapsed-min-sec S  (with max; default 250; local wall sec since bucket start,\n"
                    "                             same idea as backtest.ipynb cell 10 histogram)\n"
-                   "  --entry-elapsed-max-sec S  (default 298; inclusive)\n"
+                   "  --entry-elapsed-max-sec S  (default 300; inclusive)\n"
                    "  --edge-persist-ms N        BUY: theo-ask>=entry must hold N ms steady time (default 1000;\n"
                    "                             0 off). Matches data/real_backtest.ipynb EDGE_PERSIST_MS.\n"
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
