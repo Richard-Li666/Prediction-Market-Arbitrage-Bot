@@ -457,9 +457,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double buy_ask_min = 0.0;
   double buy_ask_max = 1.0;
 
-  /// When true: BUY the opposite outcome of the edge signal; SELL uses the other side's theo floor vs this side's bid.
-  bool invert_outcomes = false;
-
   bool poly_discover = true;
   bool poly_rollover_web_ptb = false;
   std::string poly_manual_token;
@@ -590,8 +587,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       poly_rollover_web_ptb = true;
     } else if (a == "--disable-rollover-force-sell") {
       disable_rollover_force_sell = true;
-    } else if (a == "--invert-outcomes") {
-      invert_outcomes = true;
     } else if (a == "--spot-latency-monitor") {
       spot_latency_monitor = true;
     } else if (a == "--spot-latency-report-sec" && i + 1 < argc) {
@@ -638,8 +633,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                             first; fallback RTDS Chainlink if fetch fails\n"
                    "  --disable-rollover-force-sell  do not auto FORCE_SELL on rollover\n"
                    "                               (also env POLY_DISABLE_ROLLOVER_FORCE_SELL=1)\n"
-                   "  --invert-outcomes          BUY Down when edge chose Up (and vice versa);\n"
-                   "                             SELL: compare held side bid vs the OTHER side's theo floor\n"
                    "  --spot-latency-monitor       log spot handler latency + queue depth (stderr)\n"
                    "                               (also env LL_SPOT_LATENCY_MONITOR=1)\n"
                    "  --spot-latency-report-sec S  summary interval (default 5)\n";
@@ -714,9 +707,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                 << " ms steady (real_backtest.ipynb EDGE_PERSIST_MS)\n";
     } else {
       std::cerr << "[" << src_tag << "] BUY edge persist: off\n";
-    }
-    if (invert_outcomes) {
-      std::cerr << "[" << src_tag << "] --invert-outcomes: BUY opposite of edge signal; SELL uses other side theo floor\n";
     }
     std::cerr << "[" << src_tag << "] SELL when bid >= theo - close_eps - close_early_threshold"
               << " (close_eps=" << close_eps << " close_early_threshold=" << close_early_threshold << ")\n";
@@ -929,13 +919,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         ecw = hot.bin_entry_clock_wall_ms;
       }
       if (!entry_elapsed_ok(ae, ecw)) return;
-      if (invert_outcomes) {
-        if (paper.pending_side == "Up") {
-          paper.pending_side = "Down";
-        } else if (paper.pending_side == "Down") {
-          paper.pending_side = "Up";
-        }
-      }
       paper.pending = true;
       paper.pending_action = "BUY";
       if (up_ok && dn_ok) {
@@ -952,18 +935,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     // backtest.ipynb: Up -> up_bid >= theo_up; Down -> dn_bid >= theo_dn (--close / --close-early-threshold).
     const double close_floor_up = p_up - close_eps - close_early_threshold;
     const double close_floor_dn = p_dn - close_eps - close_early_threshold;
-    if (invert_outcomes) {
-      if (paper.side == "Up") {
-        if (up_bid < close_floor_dn) return;
-      } else {
-        if (dn_bid < close_floor_up) return;
-      }
+    if (paper.side == "Up") {
+      if (up_bid < close_floor_up) return;
     } else {
-      if (paper.side == "Up") {
-        if (up_bid < close_floor_up) return;
-      } else {
-        if (dn_bid < close_floor_dn) return;
-      }
+      if (dn_bid < close_floor_dn) return;
     }
     paper.pending = true;
     paper.pending_action = "SELL";
@@ -1193,30 +1168,16 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double dn_mid_ex = 0.5 * (dn_bid + dn_ask);
       const double theo = is_up ? theo_up : theo_dn;
       const double edge = theo - ask;
-      // Match schedule(): bid >= theo - close_eps - close_early_threshold (or swapped floors if --invert-outcomes).
-      if (invert_outcomes) {
-        if (is_up) {
-          if (up_bid < theo_dn - close_eps - close_early_threshold) {
-            paper.pending = false;
-            return;
-          }
-        } else {
-          if (dn_bid < theo_up - close_eps - close_early_threshold) {
-            paper.pending = false;
-            return;
-          }
+      // Match schedule(): bid >= theo - close_eps - close_early_threshold.
+      if (is_up) {
+        if (up_bid < theo_up - close_eps - close_early_threshold) {
+          paper.pending = false;
+          return;
         }
       } else {
-        if (is_up) {
-          if (up_bid < theo_up - close_eps - close_early_threshold) {
-            paper.pending = false;
-            return;
-          }
-        } else {
-          if (dn_bid < theo_dn - close_eps - close_early_threshold) {
-            paper.pending = false;
-            return;
-          }
+        if (dn_bid < theo_dn - close_eps - close_early_threshold) {
+          paper.pending = false;
+          return;
         }
       }
       const double strategy_qty = paper.qty;
