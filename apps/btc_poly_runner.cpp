@@ -706,7 +706,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
   }
   std::int64_t last_series_mono_ns = 0;
-  constexpr std::int64_t kSeriesEveryNs = 200 * 1000 * 1000;  // 200ms
+  // Series jsonl for dashboards: at most once per this interval (steady clock).
+  constexpr std::int64_t kSeriesEveryNs = 100 * 1000 * 1000;  // 100ms
+  constexpr int kSeriesIdlePollMs = 100;  // wake consumer to sample series when event queue is quiet
 
   ll::telemetry::Pipeline tel;
   std::unique_ptr<ll::binance::StreamClient> bin_client;
@@ -1377,8 +1379,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     paper.pending = false;
   };
 
-  auto on_hot_update = [&]() {
-    // Called after any bin/poly update; compute theo + schedule/execute.
+  auto on_hot_update = [&](bool run_strategy) {
+    // Called after spot/poly updates, or on idle timer for series-only sampling.
+    // When run_strategy is false, only rate-limited series rows are written (no schedule/execute).
     std::int64_t active_epoch = -1;
     std::int64_t bin_wall_ms = 0;
     double S = 0.0, K = 0.0;
@@ -1443,6 +1446,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       }
     }
 
+    if (!run_strategy) {
+      return;
+    }
     bool enabled = false;
     {
       std::lock_guard<std::mutex> lk(paper_mu);
@@ -1523,9 +1529,16 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       std::size_t q_rem = 0;
       {
         std::unique_lock<std::mutex> lk(ev_mu);
-        ev_cv.wait(lk, [&] { return g_stop.load(std::memory_order_relaxed) || !ev_q.empty(); });
-        if (ev_q.empty() && g_stop.load(std::memory_order_relaxed)) {
-          return;
+        ev_cv.wait_for(lk, std::chrono::milliseconds(kSeriesIdlePollMs), [&] {
+          return g_stop.load(std::memory_order_relaxed) || !ev_q.empty();
+        });
+        if (ev_q.empty()) {
+          lk.unlock();
+          if (g_stop.load(std::memory_order_relaxed)) {
+            return;
+          }
+          on_hot_update(false);
+          continue;
         }
         ev = std::move(ev_q.front());
         ev_q.pop();
@@ -1983,7 +1996,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
 
         const std::int64_t t_sigma_end =
             spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
-        on_hot_update();
+        on_hot_update(true);
         const std::int64_t t_spot_end =
             spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
         if (spot_latency_monitor) {
@@ -2020,7 +2033,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             hot.edge_dn_ok_since_mono_ns = -1;
           }
         }
-        on_hot_update();
+        on_hot_update(true);
         continue;
       }
     }
