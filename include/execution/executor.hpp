@@ -1,8 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace ll::execution {
 
@@ -23,6 +26,11 @@ class PaperExecutor {
 
 class LiveExecutor {
  public:
+  /// If non-empty, each daemon JSONL request/response appends one row (see `emit_poly_daemon_traffic` in .cpp).
+  void set_poly_daemon_traffic_log(std::function<void(const nlohmann::json&)> sink) {
+    poly_daemon_traffic_sink_ = std::move(sink);
+  }
+
   // If out_order_id is provided and submit succeeds, it will be filled.
   // If submit_latency_ns is provided: set to C++→daemon→C++ JSONL round-trip for the POST path (nanoseconds),
   // or -1 if BUILD_LIVE_TRADER is off / daemon did not complete a request.
@@ -42,6 +50,12 @@ class LiveExecutor {
   bool query_garch_sigma(const std::vector<double>& resampled_mids, std::int64_t step_ms,
                          double* out_sigma_annual, std::string* error_message,
                          std::int64_t* query_latency_ns = nullptr);
+
+ private:
+  std::function<void(const nlohmann::json&)> poly_daemon_traffic_sink_;
+  void emit_poly_daemon_traffic(const nlohmann::json& request_log, bool transport_ok,
+                                const std::string& transport_err, const std::string& response_line,
+                                std::int64_t latency_ns);
 };
 
 }  // namespace ll::execution

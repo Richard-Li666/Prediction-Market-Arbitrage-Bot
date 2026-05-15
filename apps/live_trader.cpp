@@ -1,10 +1,14 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <cstring>
+#include <mutex>
 #include <string>
+
+#include <nlohmann/json.hpp>
 
 #include "btc_poly_runner.hpp"
 #include "execution/executor.hpp"
@@ -69,6 +73,45 @@ bool env_flag_true(const char* key) {
   return s == "true" || s == "yes";
 }
 
+class PolyDaemonTrafficJsonl {
+ public:
+  explicit PolyDaemonTrafficJsonl(std::string path) : path_(std::move(path)) {
+    if (path_.empty()) {
+      return;
+    }
+    try {
+      std::filesystem::path p(path_);
+      if (p.has_parent_path()) {
+        std::filesystem::create_directories(p.parent_path());
+      }
+    } catch (...) {
+    }
+    out_.open(path_, std::ios::out | std::ios::trunc);
+    ok_ = static_cast<bool>(out_);
+    if (!ok_) {
+      std::cerr << "[live_trader] cannot open poly_daemon traffic jsonl: " << path_ << "\n";
+    }
+  }
+
+  void append(const nlohmann::json& row) {
+    if (!ok_) {
+      return;
+    }
+    std::lock_guard<std::mutex> lk(mu_);
+    out_ << row.dump() << "\n";
+    out_.flush();
+  }
+
+  const std::string& path() const { return path_; }
+  bool ok() const { return ok_; }
+
+ private:
+  std::string path_;
+  std::mutex mu_;
+  std::ofstream out_;
+  bool ok_{false};
+};
+
 }  // namespace
 
 static void usage() {
@@ -84,6 +127,8 @@ static void usage() {
                "    POLY_DAEMON_CMD='python3 -u poly_daemon.py'\n"
                "  POLY_TOKEN_ID: default outcome token id when --token-id not passed\n"
                "  POLY_REQUIRE_CONFIRM=1: refuse live submit unless --confirm / -y / --yes (ignored with --dry-run).\n"
+               "  POLY_DAEMON_TRAFFIC_JSONL: path for per-request daemon JSONL log (default data/live_poly_daemon.jsonl).\n"
+               "  POLY_DISABLE_DAEMON_TRAFFIC_LOG=1: do not write the poly_daemon traffic jsonl.\n"
                "  Also loads ./.env from current directory when variables are unset.\n"
                "strategy mode:\n"
                "  live_trader --strategy [same options as paper_trader --live]\n"
@@ -219,6 +264,23 @@ int main(int argc, char** argv) {
       std::cout << "  limit_price=" << o.limit_price << " size=" << o.qty << "\n";
     }
     return 0;
+  }
+
+  std::string poly_daemon_path = "data/live_poly_daemon.jsonl";
+  if (const char* e = std::getenv("POLY_DAEMON_TRAFFIC_JSONL")) {
+    if (e[0] != '\0') {
+      poly_daemon_path = e;
+    }
+  }
+  PolyDaemonTrafficJsonl poly_daemon_log(
+      env_flag_true("POLY_DISABLE_DAEMON_TRAFFIC_LOG") ? std::string() : poly_daemon_path);
+  if (poly_daemon_log.ok()) {
+    ex.set_poly_daemon_traffic_log([&poly_daemon_log](const nlohmann::json& row) {
+      nlohmann::json r = row;
+      r["runner_source"] = "live_trader_cli";
+      poly_daemon_log.append(r);
+    });
+    std::cerr << "[live_trader] recording poly_daemon I/O to " << poly_daemon_log.path() << " (truncated)\n";
   }
 
   std::string err;

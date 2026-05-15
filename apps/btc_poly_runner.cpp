@@ -426,8 +426,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double initial_cash = 100.0;
   double risk_frac = 0.01;
   double entry = 0.15;  // theo - ask; align with data/backtest.ipynb ENTRY_DELTA_EXEC
-  /// SELL when mid >= theo - close_eps (default 0 matches notebook: mid >= theo).
+  /// SELL when mid >= theo - close_eps - close_early_threshold (default 0 matches notebook: mid >= theo).
   double close_eps = 0.0;
+  /// Exit earlier: extra slack below theo (pred ≈ mid); 0.03 ⇒ arm SELL when mid >= theo - close_eps - 0.03.
+  double close_early_threshold = 0.03;
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
   double entry_elapsed_min_sec = 250.0;
@@ -528,6 +530,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       entry = std::stod(argv[++i]);
     } else if (a == "--close" && i + 1 < argc) {
       close_eps = std::stod(argv[++i]);
+    } else if (a == "--close-early-threshold" && i + 1 < argc) {
+      close_early_threshold = std::stod(argv[++i]);
+      if (close_early_threshold < 0.0) {
+        { ll::io::SyncCerrLock _; std::cerr << "--close-early-threshold must be >= 0\n"; }
+        return 2;
+      }
     } else if (a == "--lat-ms" && i + 1 < argc) {
       lat_ms = std::stoi(argv[++i]);
     } else if (a == "--fee-rate" && i + 1 < argc) {
@@ -583,7 +591,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --initial-cash X\n"
                    "  --risk-frac F              (default 0.01)\n"
                    "  --entry X                  (theo-ask; default 0.15 per backtest.ipynb)\n"
-                   "  --close X                  (SELL when mid >= theo - X; default 0)\n"
+                   "  --close X                  (SELL when mid >= theo - X - close_early_threshold; default X=0)\n"
+                   "  --close-early-threshold Y  (extra slack vs theo for earlier exit; default 0.03; 0 restores old behavior)\n"
                    "  --lat-ms N                 (BUY/SELL delay; paper default 100 per backtest.ipynb; live 0)\n"
                    "  --fee-rate R               (default 0.075 per backtest.ipynb)\n"
                    "  --max-loss-usd L           stop opening new BUY when mark-to-market loss >= L\n"
@@ -684,6 +693,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     } else {
       std::cerr << "[" << src_tag << "] BUY edge persist: off\n";
     }
+    std::cerr << "[" << src_tag << "] SELL when mid >= theo - close_eps - close_early_threshold"
+              << " (close_eps=" << close_eps << " close_early_threshold=" << close_early_threshold << ")\n";
   }
   std::unique_ptr<TradeJsonlWriter> chainlink_ticks_writer;
   std::atomic<std::uint64_t> chainlink_tick_seq{0};
@@ -713,6 +724,37 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   }
 
   ll::execution::LiveExecutor live_ex;
+
+  std::unique_ptr<TradeJsonlWriter> poly_daemon_traffic_writer;
+  if (live_execution) {
+    bool disable_poly_daemon_log = false;
+    if (const char* d = std::getenv("POLY_DISABLE_DAEMON_TRAFFIC_LOG")) {
+      if (d[0] == '1' || d[0] == 't' || d[0] == 'T' || d[0] == 'y' || d[0] == 'Y') {
+        disable_poly_daemon_log = true;
+      }
+    }
+    if (!disable_poly_daemon_log) {
+      std::string poly_daemon_path = "data/" + out_prefix + "_poly_daemon.jsonl";
+      if (const char* e = std::getenv("POLY_DAEMON_TRAFFIC_JSONL")) {
+        if (e[0] != '\0') {
+          poly_daemon_path = e;
+        }
+      }
+      poly_daemon_traffic_writer = std::make_unique<TradeJsonlWriter>(poly_daemon_path);
+      if (poly_daemon_traffic_writer->ok()) {
+        live_ex.set_poly_daemon_traffic_log(
+            [src_tag, w = poly_daemon_traffic_writer.get()](const nlohmann::json& row) {
+              nlohmann::json r = row;
+              r["runner_source"] = src_tag;
+              w->append(r);
+            });
+        { ll::io::SyncCerrLock _;
+          std::cerr << "[" << src_tag << "] recording poly_daemon I/O to " << poly_daemon_traffic_writer->path()
+                    << " (truncated)\n";
+        }
+      }
+    }
+  }
 
   {
     ll::io::SyncCerrLock _;
@@ -871,11 +913,13 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       return;
     }
 
-    // backtest.ipynb: Up -> up_mid >= theo_up; Down -> dn_mid >= theo_dn (optional slack via --close).
+    // backtest.ipynb: Up -> up_mid >= theo_up; Down -> dn_mid >= theo_dn (--close / --close-early-threshold).
+    const double close_floor_up = p_up - close_eps - close_early_threshold;
+    const double close_floor_dn = p_dn - close_eps - close_early_threshold;
     if (paper.side == "Up") {
-      if (up_mid < p_up - close_eps) return;
+      if (up_mid < close_floor_up) return;
     } else {
-      if (dn_mid < p_dn - close_eps) return;
+      if (dn_mid < close_floor_dn) return;
     }
     paper.pending = true;
     paper.pending_action = "SELL";
@@ -1105,14 +1149,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double dn_mid_ex = 0.5 * (dn_bid + dn_ask);
       const double theo = is_up ? theo_up : theo_dn;
       const double edge = theo - ask;
-      // Match schedule(): mid >= theo - close_eps; re-check at execute time (backtest.ipynb exit rule).
+      // Match schedule(): mid >= theo - close_eps - close_early_threshold.
       if (is_up) {
-        if (up_mid_ex < theo_up - close_eps) {
+        if (up_mid_ex < theo_up - close_eps - close_early_threshold) {
           paper.pending = false;
           return;
         }
       } else {
-        if (dn_mid_ex < theo_dn - close_eps) {
+        if (dn_mid_ex < theo_dn - close_eps - close_early_threshold) {
           paper.pending = false;
           return;
         }

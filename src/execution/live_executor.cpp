@@ -21,17 +21,44 @@ static std::string getenv_str(const char* k) {
 
 }  // namespace
 
+void LiveExecutor::emit_poly_daemon_traffic(const nlohmann::json& request_log, bool transport_ok,
+                                            const std::string& transport_err,
+                                            const std::string& response_line, std::int64_t latency_ns) {
+  if (!poly_daemon_traffic_sink_) {
+    return;
+  }
+  nlohmann::json row;
+  row["schema_version"] = 1;
+  row["channel"] = "poly_daemon";
+  row["local_ts_mono_ns"] = ll::core::steady_ns();
+  row["local_ts_wall_ms"] = ll::core::system_ms();
+  row["latency_ns"] = latency_ns;
+  row["transport_ok"] = transport_ok;
+  if (!transport_err.empty()) {
+    row["transport_error"] = transport_err;
+  }
+  row["request"] = request_log;
+  row["response_raw"] = response_line;
+  bool parse_ok = false;
+  if (!response_line.empty()) {
+    try {
+      row["response"] = nlohmann::json::parse(response_line);
+      parse_ok = true;
+    } catch (...) {
+      row["response"] = nullptr;
+    }
+  } else {
+    row["response"] = nullptr;
+  }
+  row["response_parse_ok"] = parse_ok;
+  poly_daemon_traffic_sink_(row);
+}
+
 bool LiveExecutor::submit(const OrderIntent& o, std::string* error_message, std::string* out_order_id,
-                            std::int64_t* submit_latency_ns) {
+                          std::int64_t* submit_latency_ns) {
 #ifdef LL_ENABLE_LIVE_TRADER
   if (submit_latency_ns) {
     *submit_latency_ns = -1;
-  }
-  const std::string cmd = getenv_str("POLY_DAEMON_CMD");
-  std::string err;
-  if (!daemon().start(cmd, &err)) {
-    if (error_message) *error_message = "start daemon failed: " + err;
-    return false;
   }
 
   nlohmann::json req;
@@ -39,7 +66,6 @@ bool LiveExecutor::submit(const OrderIntent& o, std::string* error_message, std:
     req["cmd"] = "place_market_order";
     req["token_id"] = o.market_token_id;
     req["side"] = o.side;
-    // Market order type: default to IOC to avoid frequent FOK kills on thin books.
     const std::string mot = getenv_str("POLY_MARKET_ORDER_TYPE");
     req["order_type"] = mot.empty() ? "IOC" : mot;
     req["amount"] = o.qty;
@@ -52,18 +78,25 @@ bool LiveExecutor::submit(const OrderIntent& o, std::string* error_message, std:
     req["order_type"] = "GTC";
   }
 
-  const std::int64_t t0 = ll::core::steady_ns();
-  std::string resp_line;
-  if (!daemon().request_response_jsonl(req.dump(), &resp_line, &err)) {
-    if (submit_latency_ns) {
-      *submit_latency_ns = ll::core::steady_ns() - t0;
-    }
-    if (error_message) *error_message = "daemon request failed: " + err;
+  const std::string cmd = getenv_str("POLY_DAEMON_CMD");
+  std::string err;
+  if (!daemon().start(cmd, &err)) {
+    emit_poly_daemon_traffic(req, false, "start daemon failed: " + err, "", 0);
+    if (error_message) *error_message = "start daemon failed: " + err;
     return false;
   }
+
+  const std::int64_t t0 = ll::core::steady_ns();
+  std::string resp_line;
+  const bool io_ok = daemon().request_response_jsonl(req.dump(), &resp_line, &err);
   const std::int64_t dt_ns = ll::core::steady_ns() - t0;
   if (submit_latency_ns) {
     *submit_latency_ns = dt_ns;
+  }
+  emit_poly_daemon_traffic(req, io_ok, io_ok ? "" : err, resp_line, dt_ns);
+  if (!io_ok) {
+    if (error_message) *error_message = "daemon request failed: " + err;
+    return false;
   }
 
   nlohmann::json resp;
@@ -79,7 +112,6 @@ bool LiveExecutor::submit(const OrderIntent& o, std::string* error_message, std:
     return false;
   }
 
-  // Try to extract order id from common places.
   std::string order_id;
   if (resp.contains("order_id") && resp["order_id"].is_string()) {
     order_id = resp["order_id"].get<std::string>();
@@ -91,7 +123,6 @@ bool LiveExecutor::submit(const OrderIntent& o, std::string* error_message, std:
   }
 
   if (out_order_id) *out_order_id = order_id;
-  // Caller prints order_id; avoid duplicating it in the message line.
   if (error_message) *error_message = order_id.empty() ? resp_line : "";
   return true;
 #else
@@ -115,29 +146,29 @@ bool LiveExecutor::query_conditional_balance(const std::string& token_id, double
     *out_shares = 0.0;
   }
 
-  const std::string cmd = getenv_str("POLY_DAEMON_CMD");
-  std::string err;
-  if (!daemon().start(cmd, &err)) {
-    if (error_message) *error_message = "start daemon failed: " + err;
-    return false;
-  }
-
   nlohmann::json req;
   req["cmd"] = "get_conditional_balance";
   req["token_id"] = token_id;
 
-  const std::int64_t t0 = ll::core::steady_ns();
-  std::string resp_line;
-  if (!daemon().request_response_jsonl(req.dump(), &resp_line, &err)) {
-    if (query_latency_ns) {
-      *query_latency_ns = ll::core::steady_ns() - t0;
-    }
-    if (error_message) *error_message = "daemon request failed: " + err;
+  const std::string cmd = getenv_str("POLY_DAEMON_CMD");
+  std::string err;
+  if (!daemon().start(cmd, &err)) {
+    emit_poly_daemon_traffic(req, false, "start daemon failed: " + err, "", 0);
+    if (error_message) *error_message = "start daemon failed: " + err;
     return false;
   }
+
+  const std::int64_t t0 = ll::core::steady_ns();
+  std::string resp_line;
+  const bool io_ok = daemon().request_response_jsonl(req.dump(), &resp_line, &err);
   const std::int64_t dt_ns = ll::core::steady_ns() - t0;
   if (query_latency_ns) {
     *query_latency_ns = dt_ns;
+  }
+  emit_poly_daemon_traffic(req, io_ok, io_ok ? "" : err, resp_line, dt_ns);
+  if (!io_ok) {
+    if (error_message) *error_message = "daemon request failed: " + err;
+    return false;
   }
 
   nlohmann::json resp;
@@ -201,26 +232,34 @@ bool LiveExecutor::query_garch_sigma(const std::vector<double>& resampled_mids, 
   if (query_latency_ns) *query_latency_ns = -1;
   if (out_sigma_annual) *out_sigma_annual = 0.0;
 
-  const std::string cmd = getenv_str("POLY_DAEMON_CMD");
-  std::string err;
-  if (!daemon().start(cmd, &err)) {
-    if (error_message) *error_message = "start daemon failed: " + err;
-    return false;
-  }
-
   nlohmann::json req;
   req["cmd"] = "garch_forecast";
   req["mids"] = resampled_mids;
   req["step_ms"] = step_ms;
+  nlohmann::json req_log = req;
+  if (req_log.contains("mids") && req_log["mids"].is_array()) {
+    req_log["n_mids"] = req_log["mids"].size();
+    req_log.erase("mids");
+  }
+
+  const std::string cmd = getenv_str("POLY_DAEMON_CMD");
+  std::string err;
+  if (!daemon().start(cmd, &err)) {
+    emit_poly_daemon_traffic(req_log, false, "start daemon failed: " + err, "", 0);
+    if (error_message) *error_message = "start daemon failed: " + err;
+    return false;
+  }
 
   const std::int64_t t0 = ll::core::steady_ns();
   std::string resp_line;
-  if (!daemon().request_response_jsonl(req.dump(), &resp_line, &err)) {
-    if (query_latency_ns) *query_latency_ns = ll::core::steady_ns() - t0;
+  const bool io_ok = daemon().request_response_jsonl(req.dump(), &resp_line, &err);
+  const std::int64_t dt_ns = ll::core::steady_ns() - t0;
+  if (query_latency_ns) *query_latency_ns = dt_ns;
+  emit_poly_daemon_traffic(req_log, io_ok, io_ok ? "" : err, resp_line, dt_ns);
+  if (!io_ok) {
     if (error_message) *error_message = "daemon request failed: " + err;
     return false;
   }
-  if (query_latency_ns) *query_latency_ns = ll::core::steady_ns() - t0;
 
   nlohmann::json resp;
   try {
