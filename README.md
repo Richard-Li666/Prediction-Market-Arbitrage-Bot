@@ -55,7 +55,7 @@ Common knobs:
 | `--initial-cash X` | Starting cash (USD) |
 | `--risk-frac F` | Fraction of cash per entry BUY if `--fixed-spend-usd` not set (default `0.01`) |
 | `--fixed-spend-usd X` | Fixed USDC per BUY (overrides `--risk-frac`; Polymarket min ~ $1) |
-| `--entry X` | BUY when `theo - ask ≥ X` (default `0.15`) |
+| `--entry X` | BUY when `theo - ask ≥ X` (default `0.15`; fill at ask) |
 | `--close X` | SELL when `mid ≥ theo - X` (default `0`, matching `data/backtest.ipynb`) |
 | `--lat-ms N` | Simulated execution delay (default **100** ms for paper, matching `data/backtest.ipynb`; live uses **0**) |
 | `--fee-rate R` | Polymarket-style taker fee scale (default `0.075`, matching `data/backtest.ipynb`) |

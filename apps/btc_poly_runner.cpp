@@ -426,9 +426,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double initial_cash = 100.0;
   double risk_frac = 0.01;
   double entry = 0.15;  // theo - ask; align with data/backtest.ipynb ENTRY_DELTA_EXEC
-  /// SELL when mid >= theo - close_eps - close_early_threshold (default 0 matches notebook: mid >= theo).
+  /// SELL when bid >= theo - close_eps - close_early_threshold (default 0 matches notebook: bid >= theo).
   double close_eps = 0.0;
-  /// Exit earlier: extra slack below theo (pred ≈ mid); 0.03 ⇒ arm SELL when mid >= theo - close_eps - 0.03.
+  /// Exit earlier: extra slack below theo; 0.03 ⇒ arm SELL when bid >= theo - close_eps - 0.03.
   double close_early_threshold = 0.03;
   /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
   bool use_entry_elapsed_window = true;
@@ -591,7 +591,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --initial-cash X\n"
                    "  --risk-frac F              (default 0.01)\n"
                    "  --entry X                  (theo-ask; default 0.15 per backtest.ipynb)\n"
-                   "  --close X                  (SELL when mid >= theo - X - close_early_threshold; default X=0)\n"
+                   "  --close X                  (SELL when bid >= theo - X - close_early_threshold; default X=0)\n"
                    "  --close-early-threshold Y  (extra slack vs theo for earlier exit; default 0.03; 0 restores old behavior)\n"
                    "  --lat-ms N                 (BUY/SELL delay; paper default 100 per backtest.ipynb; live 0)\n"
                    "  --fee-rate R               (default 0.075 per backtest.ipynb)\n"
@@ -693,7 +693,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     } else {
       std::cerr << "[" << src_tag << "] BUY edge persist: off\n";
     }
-    std::cerr << "[" << src_tag << "] SELL when mid >= theo - close_eps - close_early_threshold"
+    std::cerr << "[" << src_tag << "] SELL when bid >= theo - close_eps - close_early_threshold"
               << " (close_eps=" << close_eps << " close_early_threshold=" << close_early_threshold << ")\n";
   }
   std::unique_ptr<TradeJsonlWriter> chainlink_ticks_writer;
@@ -840,7 +840,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     return elapsed_sec >= entry_elapsed_min_sec && elapsed_sec <= entry_elapsed_max_sec;
   };
 
-  auto schedule = [&](double p_up, double p_dn, double up_ask, double up_mid, double dn_ask, double dn_mid) {
+  auto schedule = [&](double p_up, double p_dn, double up_ask, double up_bid, double dn_ask, double dn_bid) {
     std::lock_guard<std::mutex> lk(paper_mu);
     const auto now_ns = ll::core::steady_ns();
     const std::int64_t lat_ns = static_cast<std::int64_t>(lat_ms) * 1'000'000LL;
@@ -913,13 +913,13 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       return;
     }
 
-    // backtest.ipynb: Up -> up_mid >= theo_up; Down -> dn_mid >= theo_dn (--close / --close-early-threshold).
+    // backtest.ipynb: Up -> up_bid >= theo_up; Down -> dn_bid >= theo_dn (--close / --close-early-threshold).
     const double close_floor_up = p_up - close_eps - close_early_threshold;
     const double close_floor_dn = p_dn - close_eps - close_early_threshold;
     if (paper.side == "Up") {
-      if (up_mid < close_floor_up) return;
+      if (up_bid < close_floor_up) return;
     } else {
-      if (dn_mid < close_floor_dn) return;
+      if (dn_bid < close_floor_dn) return;
     }
     paper.pending = true;
     paper.pending_action = "SELL";
@@ -1149,14 +1149,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double dn_mid_ex = 0.5 * (dn_bid + dn_ask);
       const double theo = is_up ? theo_up : theo_dn;
       const double edge = theo - ask;
-      // Match schedule(): mid >= theo - close_eps - close_early_threshold.
+      // Match schedule(): bid >= theo - close_eps - close_early_threshold.
       if (is_up) {
-        if (up_mid_ex < theo_up - close_eps - close_early_threshold) {
+        if (up_bid < theo_up - close_eps - close_early_threshold) {
           paper.pending = false;
           return;
         }
       } else {
-        if (dn_mid_ex < theo_dn - close_eps - close_early_threshold) {
+        if (dn_bid < theo_dn - close_eps - close_early_threshold) {
           paper.pending = false;
           return;
         }
@@ -1449,7 +1449,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       enabled = trading_enabled;
     }
     if (!enabled) return;
-    schedule(p_up, p_dn, up_ask, up_mid, dn_ask, dn_mid);
+    schedule(p_up, p_dn, up_ask, up_bid, dn_ask, dn_bid);
     execute_due();
   };
 
