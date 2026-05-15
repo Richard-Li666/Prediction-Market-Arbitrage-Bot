@@ -142,7 +142,7 @@ async function poll() {
   } catch (e) {
     console.warn(e);
   }
-  setTimeout(poll, 400);
+  setTimeout(poll, 80);
 }
 poll();
 </script>
@@ -161,7 +161,12 @@ def main() -> int:
     ap.add_argument("--chainlink", type=Path, default=None)
     ap.add_argument("--trades", type=Path, default=None, help="覆盖 trades；默认 data/<prefix>_trades.jsonl")
     ap.add_argument("--max-points", type=int, default=4000)
-    ap.add_argument("--poll", type=float, default=0.15, help="读盘间隔（秒）")
+    ap.add_argument(
+        "--poll",
+        type=float,
+        default=0.05,
+        help="读盘间隔（秒）；越小曲线越跟手，磁盘/CPU 略增。可与浏览器轮询(~80ms)配合",
+    )
     args = ap.parse_args()
 
     cwd = Path.cwd()
