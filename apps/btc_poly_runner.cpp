@@ -464,7 +464,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   }
 
   // Defaults: align with data/backtest.ipynb cell 5–7 (override via CLI).
-  const double r = 0.0;  // RISK_FREE_RATE in backtest.ipynb
+  const double r = 0.035;
   const double sigma_min = 0.05;  // guardrail: ignore unrealistically tiny realized sigma
   const double sigma_max = 5.0;   // guardrail: ignore absurd spikes
   double sigma_fallback = 0.15;
