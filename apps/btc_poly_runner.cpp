@@ -370,6 +370,46 @@ static inline std::vector<double> resample_mids_from_hist(
   return mids;
 }
 
+/// Annualized realized vol from resampled mids (matches backtest / rolling path in this file).
+static bool realized_vol_from_resampled_mids(const std::vector<double>& mids, std::int64_t step_ms,
+                                             double sigma_min, double sigma_max, double* out_sigma) {
+  if (!out_sigma || mids.size() < 10) {
+    return false;
+  }
+  std::vector<double> rets;
+  rets.reserve(mids.size() - 1);
+  for (std::size_t ri = 1; ri < mids.size(); ++ri) {
+    const double lr = std::log(mids[ri] / mids[ri - 1]);
+    if (std::isfinite(lr)) {
+      rets.push_back(lr);
+    }
+  }
+  if (rets.size() < 10) {
+    return false;
+  }
+  double mean = 0.0;
+  for (double x : rets) {
+    mean += x;
+  }
+  mean /= static_cast<double>(rets.size());
+  double var = 0.0;
+  for (double x : rets) {
+    const double d = x - mean;
+    var += d * d;
+  }
+  var /= static_cast<double>(rets.size() - 1);
+  const double steps_per_year =
+      (365.0 * 24.0 * 3600.0 * 1000.0) / static_cast<double>(std::max<std::int64_t>(1, step_ms));
+  const double sig = std::sqrt(var * steps_per_year);
+  if (!std::isfinite(sig) || sig < sigma_min || sig > sigma_max) {
+    return false;
+  }
+  *out_sigma = sig;
+  return true;
+}
+
+enum class SigmaVolMode { Rolling, SlugFixed, Constant };
+
 static inline double poly_taker_fee(double notional_usdc, double price, double fee_rate) {
   // Polymarket (crypto taker) fee:
   // fee = C * feeRate * p * (1-p), rounded to 5 decimals, min 0.00001
@@ -423,14 +463,16 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
   }
 
-  // Defaults: align with data/backtest.ipynb cell 5–6 (override via CLI).
-  const double r = 0.035;
+  // Defaults: align with data/backtest.ipynb cell 5–7 (override via CLI).
+  const double r = 0.0;  // RISK_FREE_RATE in backtest.ipynb
   const double sigma_min = 0.05;  // guardrail: ignore unrealistically tiny realized sigma
   const double sigma_max = 5.0;   // guardrail: ignore absurd spikes
   double sigma_fallback = 0.15;
   std::int64_t sigma_step_ms = 300;
-  /// Prefer GARCH(1,1) via poly_daemon (`arch`) at bucket open; fallback to realized vol on failure.
-  /// Default false matches data/backtest.ipynb SIGMA_MODE=\"realized\".
+  /// `slug_fixed` (default): σ at bucket anchor, constant for the 5m slug (backtest SIGMA_MODE=slug_fixed).
+  /// `rolling` (`realized`): re-estimate σ on every spot tick (1h window ending at current wall).
+  SigmaVolMode sigma_vol_mode = SigmaVolMode::SlugFixed;
+  /// GARCH(1,1) at bucket σ init only (`--sigma-model garch`); fallback to realized on failure.
   bool sigma_try_garch = false;
 
   double initial_cash = 100.0;
@@ -438,25 +480,25 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double entry = 0.15;  // theo - ask; align with data/backtest.ipynb ENTRY_DELTA_EXEC
   /// SELL when bid >= theo - close_eps - close_early_threshold (default 0 matches notebook: bid >= theo).
   double close_eps = 0.0;
-  /// Exit earlier: extra slack below theo; 0.03 ⇒ arm SELL when bid >= theo - close_eps - 0.03.
-  double close_early_threshold = 0.03;
-  /// BUY only when local-wall seconds since bucket start in [min, max] (aligns with backtest.ipynb cell 10).
+  /// Exit earlier: extra slack below theo; 0 matches backtest CLOSE_EARLY_THRESHOLD.
+  double close_early_threshold = 0.0;
+  /// BUY only when local-wall seconds since bucket start in [min, max] (backtest ENTRY_ELAPSED_*).
   bool use_entry_elapsed_window = true;
-  double entry_elapsed_min_sec = 250.0;
+  double entry_elapsed_min_sec = 260.0;
   double entry_elapsed_max_sec = 300.0;
-  /// BUY: `theo-ask >= entry` must hold continuously for this many ms (steady clock); 0 = off (legacy).
-  /// Matches `data/real_backtest.ipynb` EDGE_PERSIST_MS.
-  int edge_persist_ms = 1000;
-  int lat_ms = live_execution ? 0 : 100;  // data/backtest.ipynb LAT_MS
-  double fee_rate = 0.075;                // POLY_TAKER_FEE_RATE in backtest.ipynb
+  /// BUY: `theo-ask >= entry` must hold continuously for this many ms (steady clock); 0 = off.
+  int edge_persist_ms = 500;  // EDGE_PERSIST_MS in backtest.ipynb
+  int lat_ms = 0;             // LAT_MS in backtest.ipynb
+  double fee_rate = 0.0;      // POLY_TAKER_FEE_RATE in backtest.ipynb
+  /// Unrealized loss vs pos_cost_basis (incl. buy fee); <=0 disables (backtest STOP_LOSS_FRAC).
+  double stop_loss_frac = 0.4;
   double max_loss_usd = std::numeric_limits<double>::infinity();
-  /// If > 0, each entry BUY uses this USDC notional (still capped by affordable cash). Otherwise use --risk-frac.
-  double fixed_spend_usd = 0.0;
+  /// Each entry BUY uses this USDC notional (backtest TRADE_DOLLARS=1); 0 falls back to --risk-frac.
+  double fixed_spend_usd = 1.0;
   /// BUY only when chosen outcome's best ask is in [buy_ask_min, buy_ask_max] (ask must be > 0).
   bool use_buy_ask_range = true;
-  /// live_trader default [0.6, 0.9]; paper_trader --live default [0, 1] (override via --buy-ask-min/max).
-  double buy_ask_min = live_execution ? 0.6 : 0.0;
-  double buy_ask_max = live_execution ? 0.9 : 1.0;
+  double buy_ask_min = 0.6;
+  double buy_ask_max = 0.9;
 
   bool poly_discover = true;
   bool poly_rollover_web_ptb = false;
@@ -527,10 +569,19 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const std::string m = argv[++i];
       if (m == "garch" || m == "GARCH") {
         sigma_try_garch = true;
-      } else if (m == "realized" || m == "rv") {
+        sigma_vol_mode = SigmaVolMode::SlugFixed;
+      } else if (m == "realized" || m == "rv" || m == "rolling") {
         sigma_try_garch = false;
+        sigma_vol_mode = SigmaVolMode::Rolling;
+      } else if (m == "slug_fixed" || m == "fixed") {
+        sigma_try_garch = false;
+        sigma_vol_mode = SigmaVolMode::SlugFixed;
+      } else if (m == "constant") {
+        sigma_try_garch = false;
+        sigma_vol_mode = SigmaVolMode::Constant;
       } else {
-        { ll::io::SyncCerrLock _; std::cerr << "--sigma-model must be garch or realized\n"; }
+        { ll::io::SyncCerrLock _;
+          std::cerr << "--sigma-model must be slug_fixed|fixed|rolling|realized|rv|constant|garch\n"; }
         return 2;
       }
     } else if (a == "--initial-cash" && i + 1 < argc) {
@@ -551,6 +602,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       lat_ms = std::stoi(argv[++i]);
     } else if (a == "--fee-rate" && i + 1 < argc) {
       fee_rate = std::stod(argv[++i]);
+    } else if (a == "--stop-loss-frac" && i + 1 < argc) {
+      stop_loss_frac = std::stod(argv[++i]);
+      if (stop_loss_frac < 0.0) {
+        { ll::io::SyncCerrLock _; std::cerr << "--stop-loss-frac must be >= 0 (0 disables)\n"; }
+        return 2;
+      }
     } else if (a == "--max-loss-usd" && i + 1 < argc) {
       max_loss_usd = std::stod(argv[++i]);
     } else if (a == "--fixed-spend-usd" && i + 1 < argc) {
@@ -603,25 +660,28 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --risk-frac F              (default 0.01)\n"
                    "  --entry X                  (theo-ask; default 0.15 per backtest.ipynb)\n"
                    "  --close X                  (SELL when bid >= theo - X - close_early_threshold; default X=0)\n"
-                   "  --close-early-threshold Y  (extra slack vs theo for earlier exit; default 0.03; 0 restores old behavior)\n"
-                   "  --lat-ms N                 (BUY/SELL delay; paper default 100 per backtest.ipynb; live 0)\n"
-                   "  --fee-rate R               (default 0.075 per backtest.ipynb)\n"
+                   "  --close-early-threshold Y  (extra slack vs theo; default 0 per backtest.ipynb)\n"
+                   "  --lat-ms N                 (BUY/SELL delay; default 0 per backtest.ipynb)\n"
+                   "  --fee-rate R               (default 0 per backtest.ipynb POLY_TAKER_FEE_RATE)\n"
+                   "  --stop-loss-frac F         (exit when (bid proceeds - cost_basis)/cost_basis <= -F; default 0.4)\n"
                    "  --max-loss-usd L           stop opening new BUY when mark-to-market loss >= L\n"
                    "                             (vs --initial-cash baseline; default: no cap)\n"
-                   "  --fixed-spend-usd X        each BUY uses X USDC notional (overrides --risk-frac);\n"
-                   "                             still capped by cash; Polymarket min ~$1 applies\n"
-                   "  --entry-elapsed-min-sec S  (with max; default 250; local wall sec since bucket start,\n"
-                   "                             same idea as backtest.ipynb cell 10 histogram)\n"
+                   "  --fixed-spend-usd X        each BUY uses X USDC notional (default 1; 0 uses --risk-frac)\n"
+                   "  --entry-elapsed-min-sec S  (with max; default 260; local wall sec since bucket start)\n"
                    "  --entry-elapsed-max-sec S  (default 300; inclusive)\n"
-                   "  --edge-persist-ms N        BUY: theo-ask>=entry must hold N ms steady time (default 1000;\n"
-                   "                             0 off). Matches data/real_backtest.ipynb EDGE_PERSIST_MS.\n"
+                   "  --edge-persist-ms N        BUY: theo-ask>=entry must hold N ms steady time (default 500;\n"
+                   "                             0 off). Matches backtest.ipynb EDGE_PERSIST_MS.\n"
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
-                   "  --buy-ask-min P            (with max; live default 0.6, paper default 0)\n"
-                   "  --buy-ask-max P            (live default 0.9, paper default 1.0)\n"
+                   "  --buy-ask-min P            (with max; default 0.6 per backtest.ipynb)\n"
+                   "  --buy-ask-max P            (default 0.9)\n"
                    "  --no-buy-ask-range         allow BUY at any ask (restores min-ask 0.02 guard only)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
-                   "  --sigma-model garch|realized   (default realized per backtest.ipynb; garch via poly_daemon)\n"
+                   "  --sigma-model slug_fixed|fixed|rolling|realized|rv|constant|garch\n"
+                   "                             (default slug_fixed: σ at bucket start, constant per slug;\n"
+                   "                              constant: fixed --sigma for entire run (backtest SIGMA_MODE=constant);\n"
+                   "                              rolling/realized/rv: 1h window updates each spot tick;\n"
+                   "                              garch: slug_fixed + GARCH at bucket open via poly_daemon)\n"
                    "  --spot-feed chainlink|binance   spot price for theo S + vol history (default: chainlink RTDS)\n"
                    "  --host/--port/--parse-workers/--stream ... (binance; only if --spot-feed binance)\n"
                    "  --poly-parse-workers N     (polymarket json parse workers; default 0)\n"
@@ -705,9 +765,28 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
     if (edge_persist_ns > 0) {
       std::cerr << "[" << src_tag << "] BUY edge persist: " << edge_persist_ms
-                << " ms steady (real_backtest.ipynb EDGE_PERSIST_MS)\n";
+                << " ms steady (backtest.ipynb EDGE_PERSIST_MS)\n";
     } else {
       std::cerr << "[" << src_tag << "] BUY edge persist: off\n";
+    }
+    if (fixed_spend_usd > 0.0) {
+      std::cerr << "[" << src_tag << "] position size: fixed $" << fixed_spend_usd << " per BUY\n";
+    } else {
+      std::cerr << "[" << src_tag << "] position size: risk_frac=" << risk_frac << "\n";
+    }
+  {
+    const char* sigma_mode_str = "rolling (1h realized each tick)";
+    if (sigma_vol_mode == SigmaVolMode::SlugFixed) {
+      sigma_mode_str = "slug_fixed (per slug, bucket anchor)";
+    } else if (sigma_vol_mode == SigmaVolMode::Constant) {
+      sigma_mode_str = "constant (--sigma)";
+    }
+    std::cerr << "[" << src_tag << "] sigma vol mode: " << sigma_mode_str
+              << (sigma_try_garch ? " + GARCH at bucket init" : "") << "\n";
+  }
+    if (stop_loss_frac > 0.0) {
+      std::cerr << "[" << src_tag << "] stop loss: unrealized PnL / cost_basis <= -" << stop_loss_frac
+                << "\n";
     }
     std::cerr << "[" << src_tag << "] SELL when bid >= theo - close_eps - close_early_threshold"
               << " (close_eps=" << close_eps << " close_early_threshold=" << close_early_threshold << ")\n";
@@ -835,10 +914,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     std::string token_id;
     std::string slug;
     double qty{0.0};  // fractional shares allowed
+    double pos_cost_basis{0.0};  // buy cost + fee (backtest pos_cost_basis)
     double cash{0.0};
     bool pending{false};
     std::string pending_action; // BUY/SELL
     std::string pending_side;
+    std::string pending_exit_reason;  // take_profit | stop_loss
     std::int64_t due_ns{0};
     bool risk_stop{false};
     std::int64_t cooldown_until_ns{0};
@@ -846,6 +927,19 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   paper.cash = initial_cash;
   constexpr std::int64_t kCooldownNs = 10'000'000'000LL;  // 10 seconds
   bool trading_enabled = false;  // skip the very first slug; enable after first rollover
+
+  auto stop_loss_signal = [&](double bid, double qty) -> bool {
+    if (stop_loss_frac <= 0.0 || paper.pos_cost_basis <= 0.0 || qty <= 0.0) {
+      return false;
+    }
+    if (!std::isfinite(bid) || bid <= 0.0) {
+      return false;
+    }
+    const double proceeds = qty * bid;
+    const double fee = poly_taker_fee(proceeds, bid, fee_rate);
+    const double pnl_frac = (proceeds - fee - paper.pos_cost_basis) / paper.pos_cost_basis;
+    return pnl_frac <= -stop_loss_frac;
+  };
 
   auto entry_elapsed_ok = [&](std::int64_t active_epoch_sec, std::int64_t entry_clock_wall_ms) -> bool {
     if (!use_entry_elapsed_window) {
@@ -933,17 +1027,25 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       return;
     }
 
-    // backtest.ipynb: Up -> up_bid >= theo_up; Down -> dn_bid >= theo_dn (--close / --close-early-threshold).
+    // backtest.ipynb: take_profit on bid >= theo - ...; stop_loss on unrealized loss vs cost_basis.
     const double close_floor_up = p_up - close_eps - close_early_threshold;
     const double close_floor_dn = p_dn - close_eps - close_early_threshold;
+    bool stop = false;
+    bool take_profit = false;
     if (paper.side == "Up") {
-      if (up_bid < close_floor_up) return;
+      stop = stop_loss_signal(up_bid, paper.qty);
+      take_profit = up_bid >= close_floor_up;
     } else {
-      if (dn_bid < close_floor_dn) return;
+      stop = stop_loss_signal(dn_bid, paper.qty);
+      take_profit = dn_bid >= close_floor_dn;
+    }
+    if (!stop && !take_profit) {
+      return;
     }
     paper.pending = true;
     paper.pending_action = "SELL";
     paper.pending_side = paper.side;
+    paper.pending_exit_reason = stop ? "stop_loss" : "take_profit";
     paper.due_ns = now_ns + lat_ns;
   };
 
@@ -1100,6 +1202,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       paper.slug = slug;
       paper.token_id = want_up ? feed_up.token_id() : feed_down.token_id();
       paper.qty = qty;
+      paper.pos_cost_basis = cost + fee;
       {
         double eq = paper.cash;
         if (paper.have_pos) {
@@ -1169,16 +1272,18 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       const double dn_mid_ex = 0.5 * (dn_bid + dn_ask);
       const double theo = is_up ? theo_up : theo_dn;
       const double edge = theo - ask;
-      // Match schedule(): bid >= theo - close_eps - close_early_threshold.
-      if (is_up) {
-        if (up_bid < theo_up - close_eps - close_early_threshold) {
-          paper.pending = false;
-          return;
-        }
-      } else {
-        if (dn_bid < theo_dn - close_eps - close_early_threshold) {
-          paper.pending = false;
-          return;
+      const bool exit_is_stop = (paper.pending_exit_reason == "stop_loss");
+      if (!exit_is_stop) {
+        if (is_up) {
+          if (up_bid < theo_up - close_eps - close_early_threshold) {
+            paper.pending = false;
+            return;
+          }
+        } else {
+          if (dn_bid < theo_dn - close_eps - close_early_threshold) {
+            paper.pending = false;
+            return;
+          }
         }
       }
       const double strategy_qty = paper.qty;
@@ -1327,6 +1432,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["source"] = src_tag;
         row["event_type"] = "trade";
         row["action"] = "SELL";
+        row["exit_reason"] = paper.pending_exit_reason.empty() ? "take_profit" : paper.pending_exit_reason;
         row["slug"] = paper.slug;
         row["side"] = paper.side;
         row["token_id"] = paper.token_id;
@@ -1387,14 +1493,17 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       }
       paper.have_pos = false;
       paper.qty = 0.0;
+      paper.pos_cost_basis = 0.0;
       paper.side.clear();
       paper.slug.clear();
       paper.token_id.clear();
+      paper.pending_exit_reason.clear();
       paper.pending = false;
       return;
     }
     // Unknown state; clear pending.
     paper.pending = false;
+    paper.pending_exit_reason.clear();
   };
 
   auto on_hot_update = [&](bool run_strategy) {
@@ -1583,6 +1692,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             paper.have_pos = false;
             paper.pending = false;
             paper.qty = 0.0;
+            paper.pos_cost_basis = 0.0;
             paper.side.clear();
             paper.slug.clear();
             paper.token_id.clear();
@@ -1670,6 +1780,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
               paper.have_pos = false;
               paper.pending = false;
               paper.qty = 0.0;
+              paper.pos_cost_basis = 0.0;
               paper.side.clear();
               paper.slug.clear();
               paper.token_id.clear();
@@ -1781,6 +1892,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                 paper.have_pos = false;
                 paper.pending = false;
                 paper.qty = 0.0;
+                paper.pos_cost_basis = 0.0;
                 paper.side.clear();
                 paper.slug.clear();
                 paper.token_id.clear();
@@ -1874,6 +1986,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             spot_latency_monitor ? ll::core::steady_ns() : std::int64_t{0};
         bool need_sigma = false;
         bool have_full_hour = false;
+        std::int64_t sigma_anchor_wall_ms = wall_ms;
         std::vector<double> resampled_mids;
 
         {
@@ -1886,12 +1999,22 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           while (!hot.bin_hist.empty() && hot.bin_hist.front().first < wall_ms - 3600 * 1000) {
             hot.bin_hist.pop_front();
           }
-          if (hot.active_epoch >= 0 && !hot.have_sigma && wall_s >= hot.active_epoch) {
+          if (sigma_vol_mode == SigmaVolMode::Constant && hot.active_epoch >= 0 &&
+              wall_s >= hot.active_epoch) {
+            hot.have_sigma = true;
+            hot.sigma_bucket = sigma_fallback;
+          } else if (hot.active_epoch >= 0 && !hot.have_sigma && wall_s >= hot.active_epoch) {
             need_sigma = true;
-            have_full_hour =
-                !hot.bin_hist.empty() && (wall_ms - hot.bin_hist.front().first >= 3600 * 1000);
+            if (sigma_vol_mode == SigmaVolMode::SlugFixed) {
+              sigma_anchor_wall_ms = hot.active_epoch * 1000LL;
+            } else {
+              sigma_anchor_wall_ms = wall_ms;
+            }
+            have_full_hour = !hot.bin_hist.empty() &&
+                             (sigma_anchor_wall_ms - hot.bin_hist.front().first >= 3600 * 1000);
             if (have_full_hour) {
-              resampled_mids = resample_mids_from_hist(hot.bin_hist, wall_ms, sigma_step_ms);
+              resampled_mids =
+                  resample_mids_from_hist(hot.bin_hist, sigma_anchor_wall_ms, sigma_step_ms);
             }
           }
         }
@@ -1909,7 +2032,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                 {
                   ll::io::SyncCerrLock _;
                   std::cerr << log_pfx << " GARCH sigma=" << garch_sig
-                            << " n_mids=" << resampled_mids.size();
+                            << " n_mids=" << resampled_mids.size()
+                            << " anchor_wall_ms=" << sigma_anchor_wall_ms;
                   if (glat >= 0) std::cerr << " latency_ms=" << (static_cast<double>(glat) / 1e6);
                   std::cerr << "\n";
                 }
@@ -1928,27 +2052,9 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             }
           }
 #endif
-          if (!std::isfinite(final_sig) && resampled_mids.size() >= 10) {
-            std::vector<double> rets;
-            rets.reserve(resampled_mids.size() - 1);
-            for (std::size_t ri = 1; ri < resampled_mids.size(); ++ri) {
-              const double lr = std::log(resampled_mids[ri] / resampled_mids[ri - 1]);
-              if (std::isfinite(lr)) rets.push_back(lr);
-            }
-            if (rets.size() >= 10) {
-              double mean = 0.0;
-              for (double x : rets) mean += x;
-              mean /= static_cast<double>(rets.size());
-              double var = 0.0;
-              for (double x : rets) {
-                double d = x - mean;
-                var += d * d;
-              }
-              var /= static_cast<double>(rets.size() - 1);
-              const double steps_per_year =
-                  (365.0 * 24.0 * 3600.0 * 1000.0) / static_cast<double>(sigma_step_ms);
-              final_sig = std::sqrt(var * steps_per_year);
-            }
+          if (!std::isfinite(final_sig)) {
+            realized_vol_from_resampled_mids(resampled_mids, sigma_step_ms, sigma_min, sigma_max,
+                                               &final_sig);
           }
 
           {
@@ -1956,6 +2062,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             if (std::isfinite(final_sig) && final_sig >= sigma_min && final_sig <= sigma_max) {
               hot.have_sigma = true;
               hot.sigma_bucket = final_sig;
+              if (sigma_vol_mode == SigmaVolMode::SlugFixed) {
+                ll::io::SyncCerrLock _;
+                std::cerr << log_pfx << " slug_fixed sigma=" << final_sig
+                          << " slug=" << hot.slug << " anchor_wall_ms=" << sigma_anchor_wall_ms
+                          << "\n";
+              }
             } else {
               hot.have_sigma = false;
               hot.sigma_bucket = 0.0;
@@ -1967,8 +2079,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           hot.sigma_bucket = 0.0;
         }
 
-        // Rolling realized σ every spot tick (data/backtest.ipynb), after optional first-time GARCH path.
-        {
+        // Rolling realized σ every spot tick (only when --sigma-model rolling|realized|rv).
+        if (sigma_vol_mode == SigmaVolMode::Rolling) {
           bool in_bucket = false;
           bool rv_full_hour = false;
           std::vector<double> rv_mids;
@@ -1984,30 +2096,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             }
           }
           if (in_bucket && rv_full_hour && rv_mids.size() >= 10) {
-            std::vector<double> rets;
-            rets.reserve(rv_mids.size() - 1);
-            for (std::size_t ri = 1; ri < rv_mids.size(); ++ri) {
-              const double lr = std::log(rv_mids[ri] / rv_mids[ri - 1]);
-              if (std::isfinite(lr)) rets.push_back(lr);
-            }
-            if (rets.size() >= 10) {
-              double mean = 0.0;
-              for (double x : rets) mean += x;
-              mean /= static_cast<double>(rets.size());
-              double var = 0.0;
-              for (double x : rets) {
-                double d = x - mean;
-                var += d * d;
-              }
-              var /= static_cast<double>(rets.size() - 1);
-              const double steps_per_year =
-                  (365.0 * 24.0 * 3600.0 * 1000.0) / static_cast<double>(sigma_step_ms);
-              const double rv_sig = std::sqrt(var * steps_per_year);
-              if (std::isfinite(rv_sig) && rv_sig >= sigma_min && rv_sig <= sigma_max) {
-                std::lock_guard<std::mutex> lk(hot.mu);
-                hot.have_sigma = true;
-                hot.sigma_bucket = rv_sig;
-              }
+            double rv_sig = std::numeric_limits<double>::quiet_NaN();
+            if (realized_vol_from_resampled_mids(rv_mids, sigma_step_ms, sigma_min, sigma_max,
+                                                 &rv_sig)) {
+              std::lock_guard<std::mutex> lk(hot.mu);
+              hot.have_sigma = true;
+              hot.sigma_bucket = rv_sig;
             }
           }
         }
