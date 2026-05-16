@@ -452,10 +452,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   double max_loss_usd = std::numeric_limits<double>::infinity();
   /// If > 0, each entry BUY uses this USDC notional (still capped by affordable cash). Otherwise use --risk-frac.
   double fixed_spend_usd = 0.0;
-  /// BUY only when chosen outcome's best ask is in [buy_ask_min, buy_ask_max] (default [0, 1]; ask must be > 0).
+  /// BUY only when chosen outcome's best ask is in [buy_ask_min, buy_ask_max] (ask must be > 0).
   bool use_buy_ask_range = true;
-  double buy_ask_min = 0.0;
-  double buy_ask_max = 1.0;
+  /// live_trader default [0.6, 0.9]; paper_trader --live default [0, 1] (override via --buy-ask-min/max).
+  double buy_ask_min = live_execution ? 0.6 : 0.0;
+  double buy_ask_max = live_execution ? 0.9 : 1.0;
 
   bool poly_discover = true;
   bool poly_rollover_web_ptb = false;
@@ -615,8 +616,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --edge-persist-ms N        BUY: theo-ask>=entry must hold N ms steady time (default 1000;\n"
                    "                             0 off). Matches data/real_backtest.ipynb EDGE_PERSIST_MS.\n"
                    "  --no-entry-elapsed-window  allow BUY any time in bucket (disables the above)\n"
-                   "  --buy-ask-min P            (with max; default 0; BUY only if best ask in [min, max])\n"
-                   "  --buy-ask-max P            (default 1.0)\n"
+                   "  --buy-ask-min P            (with max; live default 0.6, paper default 0)\n"
+                   "  --buy-ask-max P            (live default 0.9, paper default 1.0)\n"
                    "  --no-buy-ask-range         allow BUY at any ask (restores min-ask 0.02 guard only)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
