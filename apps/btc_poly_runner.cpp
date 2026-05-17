@@ -11,8 +11,10 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <condition_variable>
 #include <mutex>
+#include <sstream>
 #include <queue>
 #include <string>
 #include <thread>
@@ -154,7 +156,108 @@ std::string binance_klines_rest_base(const ll::binance::StreamClientConfig& bin_
   return "https://api.binance.com";
 }
 
-/// Fetch past 1h of Binance 1s klines and populate bin_hist for immediate sigma computation.
+static bool parse_chainlink_jsonl_row(const nlohmann::json& j, std::int64_t* payload_ts_ms, double* px) {
+  if (!payload_ts_ms || !px || !j.is_object()) {
+    return false;
+  }
+  if (j.value("event_type", std::string()) != "chainlink") {
+    return false;
+  }
+  if (!j.contains("payload_ts_ms")) {
+    return false;
+  }
+  *payload_ts_ms = j["payload_ts_ms"].get<std::int64_t>();
+  if (j.contains("payload") && j["payload"].is_object() && j["payload"].contains("price")) {
+    *px = j["payload"]["price"].get<double>();
+  } else {
+    return false;
+  }
+  return *payload_ts_ms > 0 && std::isfinite(*px) && *px > 0.0;
+}
+
+static void ingest_chainlink_jsonl_lines(const std::string& blob, std::int64_t min_payload_ts_ms,
+                                         std::map<std::int64_t, double>& by_ts) {
+  std::istringstream ss(blob);
+  std::string line;
+  while (std::getline(ss, line)) {
+    if (line.empty()) {
+      continue;
+    }
+    try {
+      const auto j = nlohmann::json::parse(line);
+      std::int64_t ts_ms = 0;
+      double px = 0.0;
+      if (!parse_chainlink_jsonl_row(j, &ts_ms, &px) || ts_ms < min_payload_ts_ms) {
+        continue;
+      }
+      by_ts[ts_ms] = px;
+    } catch (...) {
+    }
+  }
+}
+
+/// Tail-read large jsonl (e.g. `data/chainlink_price.jsonl`) for the last ~12MB of lines.
+static void ingest_chainlink_jsonl_file(const std::string& path, std::int64_t min_payload_ts_ms,
+                                        std::map<std::int64_t, double>& by_ts) {
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) {
+    return;
+  }
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in) {
+    return;
+  }
+  const std::streamoff sz = in.tellg();
+  if (sz <= 0) {
+    return;
+  }
+  constexpr std::streamoff kMaxTailBytes = 12 * 1024 * 1024;
+  const std::streamoff start = (sz > kMaxTailBytes) ? (sz - kMaxTailBytes) : 0;
+  in.seekg(start);
+  std::string blob((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  if (start > 0) {
+    const auto nl = blob.find('\n');
+    if (nl != std::string::npos) {
+      blob.erase(0, nl + 1);
+    }
+  }
+  ingest_chainlink_jsonl_lines(blob, min_payload_ts_ms, by_ts);
+}
+
+/// Prefill σ history from Chainlink jsonl (`payload_ts_ms` + `payload.price`, same as backtest.ipynb).
+void prefill_bin_hist_from_chainlink_jsonl(std::deque<std::pair<std::int64_t, double>>& hist,
+                                           const std::vector<std::string>& paths,
+                                           const char* log_pfx) {
+  const std::int64_t now_ms = ll::core::system_ms();
+  const std::int64_t min_ts = now_ms - 3600 * 1000LL;
+  std::map<std::int64_t, double> by_ts;
+  for (const auto& path : paths) {
+    if (path.empty()) {
+      continue;
+    }
+    ingest_chainlink_jsonl_file(path, min_ts, by_ts);
+  }
+  for (const auto& kv : by_ts) {
+    hist.emplace_back(kv.first, kv.second);
+  }
+  {
+    ll::io::SyncCerrLock _;
+    std::cerr << log_pfx << " [prefill] Chainlink jsonl → bin_hist: " << by_ts.size()
+              << " points (payload_ts_ms >= now-1h)";
+    if (!paths.empty()) {
+      std::cerr << " paths=";
+      for (std::size_t i = 0; i < paths.size(); ++i) {
+        if (i) {
+          std::cerr << ",";
+        }
+        std::cerr << paths[i];
+      }
+    }
+    std::cerr << "\n";
+  }
+}
+
+/// Fetch past 1h of Binance 1s klines and populate bin_hist (used when --spot-feed binance).
 void prefill_bin_hist(std::deque<std::pair<std::int64_t, double>>& hist,
                       const ll::binance::StreamClientConfig& bin_cfg) {
   const std::string url = binance_klines_rest_base(bin_cfg) +
@@ -266,6 +369,8 @@ struct HotState {
 
   double sigma_bucket{0.0};
   bool have_sigma{false};
+  /// True once bin_hist covers ≥1h before the current σ anchor (slug bucket start or rolling wall).
+  bool sigma_vol_window_full{false};
 
   bool have_up{false};
   double up_bid{0.0};
@@ -683,6 +788,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "                              rolling/realized/rv: 1h window updates each spot tick;\n"
                    "                              garch: slug_fixed + GARCH at bucket open via poly_daemon)\n"
                    "  --spot-feed chainlink|binance   spot price for theo S + vol history (default: chainlink RTDS)\n"
+                   "  env CHAINLINK_PREFILL_JSONL     extra jsonl for σ prefill (payload_ts_ms/price)\n"
                    "  --host/--port/--parse-workers/--stream ... (binance; only if --spot-feed binance)\n"
                    "  --poly-parse-workers N     (polymarket json parse workers; default 0)\n"
                    "  --out-prefix NAME          (under data/: *_trades.jsonl, *_series.jsonl; each process start\n"
@@ -735,9 +841,26 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
   }
 
-  // 每次启动只保留本会话：先删旧文件再 trunc 打开（trades / series / chainlink ticks）。
   const std::string trades_path = "data/" + out_prefix + "_trades.jsonl";
   const std::string series_path = "data/" + out_prefix + "_series.jsonl";
+  const std::string cl_path = "data/" + out_prefix + "_chainlink.jsonl";
+
+  HotState hot;
+  if (spot_feed_chainlink) {
+    std::vector<std::string> cl_prefill_paths;
+    if (const char* envp = std::getenv("CHAINLINK_PREFILL_JSONL")) {
+      if (envp[0]) {
+        cl_prefill_paths.emplace_back(envp);
+      }
+    }
+    cl_prefill_paths.emplace_back("data/chainlink_price.jsonl");
+    cl_prefill_paths.emplace_back(cl_path);
+    prefill_bin_hist_from_chainlink_jsonl(hot.bin_hist, cl_prefill_paths, log_pfx);
+  } else {
+    prefill_bin_hist(hot.bin_hist, bin_cfg);
+  }
+
+  // 每次启动只保留本会话：先删旧文件再 trunc 打开（trades / series / chainlink ticks）。
   reset_session_jsonl_file(trades_path);
   reset_session_jsonl_file(series_path);
   TradeJsonlWriter trades_writer(trades_path);
@@ -794,7 +917,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   std::unique_ptr<TradeJsonlWriter> chainlink_ticks_writer;
   std::atomic<std::uint64_t> chainlink_tick_seq{0};
   if (spot_feed_chainlink) {
-    const std::string cl_path = "data/" + out_prefix + "_chainlink.jsonl";
     reset_session_jsonl_file(cl_path);
     chainlink_ticks_writer = std::make_unique<TradeJsonlWriter>(cl_path);
     if (chainlink_ticks_writer->ok()) {
@@ -816,11 +938,6 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   ll::polymarket::WsFixedTokenQuoteFeed feed_down(&tel);
   feed_up.set_parse_workers(poly_parse_workers);
   feed_down.set_parse_workers(poly_parse_workers);
-
-  HotState hot;
-  if (!spot_feed_chainlink) {
-    prefill_bin_hist(hot.bin_hist, bin_cfg);
-  }
 
   ll::execution::LiveExecutor live_ex;
 
@@ -927,6 +1044,26 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   paper.cash = initial_cash;
   constexpr std::int64_t kCooldownNs = 10'000'000'000LL;  // 10 seconds
   bool trading_enabled = false;  // skip the very first slug; enable after first rollover
+
+  auto append_sigma_trade_fields = [&](nlohmann::json& row, std::int64_t active_epoch_sec,
+                                     std::int64_t ref_wall_ms) {
+    bool window_full = false;
+    bool slug_sigma_ready = false;
+    std::int64_t anchor_ms = ref_wall_ms;
+    if (sigma_vol_mode == SigmaVolMode::SlugFixed && active_epoch_sec >= 0) {
+      anchor_ms = active_epoch_sec * 1000LL;
+    }
+    {
+      std::lock_guard<std::mutex> lk(hot.mu);
+      slug_sigma_ready = hot.have_sigma;
+      if (!hot.bin_hist.empty()) {
+        window_full = hot.bin_hist.front().first <= anchor_ms - 3600 * 1000LL;
+      }
+    }
+    row["sigma_vol_window_full"] = window_full;
+    row["sigma_slug_ready"] = slug_sigma_ready;
+    row["sigma_fallback"] = !slug_sigma_ready;
+  };
 
   auto stop_loss_signal = [&](double bid, double qty) -> bool {
     if (stop_loss_frac <= 0.0 || paper.pos_cost_basis <= 0.0 || qty <= 0.0) {
@@ -1085,6 +1222,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     const double rem_s = std::max(0.001, (exp_wall_ms - bin_wall_ms) / 1000.0);
     const double T_years = rem_s / (365.0 * 24.0 * 3600.0);
     const double sigma_use = have_sigma ? sigma_bucket : sigma_fallback;
+    const bool sigma_is_fallback = !have_sigma;
     const double p_up = digital_call_prob(S, K, T_years, sigma_use, r);
     const double p_dn = digital_call_prob(K, S, T_years, sigma_use, r);  // placeholder; overwritten below
     const double d2 = (std::log(S / K) + (r - 0.5 * sigma_use * sigma_use) * T_years) /
@@ -1227,6 +1365,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["K"] = K;
         row["T_s"] = rem_s;
         row["sigma"] = sigma_use;
+        append_sigma_trade_fields(row, active_epoch, bin_wall_ms);
         row["theo"] = theo;
         row["bid"] = (want_up ? up_bid : dn_bid);
         row["ask"] = ask;
@@ -1249,6 +1388,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         std::lock_guard<std::mutex> pk(print_mu);
         std::cout << log_pfx << " BUY side=" << paper.side << " slug=" << paper.slug
                   << " S=" << S << " K=" << K << " T_s=" << rem_s << " sigma=" << sigma_use
+                  << (sigma_is_fallback ? " (fallback)" : "")
                   << " theo=" << theo << " bid=" << (want_up ? up_bid : dn_bid) << " ask=" << ask
                   << " mid=" << mid << " edge=" << edge << " qty=" << qty
                   << " cost=" << cost << " fee=" << fee
@@ -1442,6 +1582,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["K"] = K;
         row["T_s"] = rem_s;
         row["sigma"] = sigma_use;
+        append_sigma_trade_fields(row, active_epoch, bin_wall_ms);
         row["theo"] = theo;
         row["bid"] = bid;
         row["ask"] = ask;
@@ -1471,6 +1612,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         std::lock_guard<std::mutex> pk(print_mu);
         std::cout << log_pfx << " SELL side=" << paper.side << " slug=" << paper.slug
                   << " S=" << S << " K=" << K << " T_s=" << rem_s << " sigma=" << sigma_use
+                  << (sigma_is_fallback ? " (fallback)" : "")
                   << " theo=" << theo << " bid=" << bid << " ask=" << ask << " mid=" << mid
                   << " edge=" << edge << " qty=" << sell_qty << " proceeds=" << proceeds
                   << " fee=" << fee << " cash_before=" << cash_before << " cash_after=" << paper.cash;
@@ -1996,7 +2138,16 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           hot.bin_wall_ms = wall_ms;
           hot.bin_entry_clock_wall_ms = entry_clock_wall_ms;
           hot.bin_hist.emplace_back(wall_ms, mid);
-          while (!hot.bin_hist.empty() && hot.bin_hist.front().first < wall_ms - 3600 * 1000) {
+          // Rolling window for σ; slug_fixed also keeps [bucket_anchor-1h, …] through the 5m slug.
+          std::int64_t hist_trim_floor_ms = wall_ms - 3600 * 1000;
+          if (sigma_vol_mode == SigmaVolMode::SlugFixed && hot.active_epoch >= 0) {
+            const std::int64_t slug_anchor_ms = hot.active_epoch * 1000LL;
+            const std::int64_t slug_vol_start_ms = slug_anchor_ms - 3600 * 1000LL;
+            if (slug_vol_start_ms < hist_trim_floor_ms) {
+              hist_trim_floor_ms = slug_vol_start_ms;
+            }
+          }
+          while (!hot.bin_hist.empty() && hot.bin_hist.front().first < hist_trim_floor_ms) {
             hot.bin_hist.pop_front();
           }
           if (sigma_vol_mode == SigmaVolMode::Constant && hot.active_epoch >= 0 &&
@@ -2010,9 +2161,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             } else {
               sigma_anchor_wall_ms = wall_ms;
             }
-            have_full_hour = !hot.bin_hist.empty() &&
-                             (sigma_anchor_wall_ms - hot.bin_hist.front().first >= 3600 * 1000);
+            // slug_fixed anchors at bucket open: need 1h of mids ending at anchor (see resample_mids_from_hist).
+            have_full_hour =
+                !hot.bin_hist.empty() &&
+                hot.bin_hist.front().first <= sigma_anchor_wall_ms - 3600 * 1000LL;
             if (have_full_hour) {
+              hot.sigma_vol_window_full = true;
               resampled_mids =
                   resample_mids_from_hist(hot.bin_hist, sigma_anchor_wall_ms, sigma_step_ms);
             }
@@ -2091,6 +2245,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
               rv_full_hour =
                   !hot.bin_hist.empty() && (wall_ms - hot.bin_hist.front().first >= 3600 * 1000);
               if (rv_full_hour) {
+                hot.sigma_vol_window_full = true;
                 rv_mids = resample_mids_from_hist(hot.bin_hist, wall_ms, sigma_step_ms);
               }
             }
