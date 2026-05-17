@@ -35,6 +35,7 @@ if str(_TOOLS_DIR) not in sys.path:
 from live_plot_common import (
     JsonlTail,
     finite,
+    format_sigma_status,
     iter_trade_markers_from_file,
     parse_chainlink_line,
     parse_series_line,
@@ -54,7 +55,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <style>
  body { font-family: system-ui, sans-serif; margin: 16px; background: #121212; color: #e0e0e0; }
  h1 { font-size: 1.1rem; margin: 0 0 12px; word-break: break-all; }
- .hint { font-size: 0.85rem; color: #888; margin-bottom: 20px; }
+ .hint { font-size: 0.85rem; color: #888; margin-bottom: 8px; }
+ #sigmaStatus { font-size: 0.95rem; color: #aed581; margin: 0 0 16px; font-variant-numeric: tabular-nums; }
+ #sigmaStatus.fallback { color: #ffb74d; }
  .wrap { max-width: 1100px; }
  canvas { background: #1e1e1e; border-radius: 8px; }
 </style>
@@ -62,6 +65,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
 <h1 id="title">加载中…</h1>
+<p id="sigmaStatus">σ —</p>
 <p class="hint">横轴：当前 5m bucket 内已过秒数 (0–300)。绿▲买、红▼卖（来自 <code>*_trades.jsonl</code> 的 trade）。换窗会清空重画。</p>
 <div><canvas id="cProb" height="220"></canvas></div>
 <div style="height:16px"></div>
@@ -123,6 +127,9 @@ async function poll() {
     const r = await fetch('/data.json', { cache: 'no-store' });
     const j = await r.json();
     document.getElementById('title').textContent = j.slug || '(无数据)';
+    const sigEl = document.getElementById('sigmaStatus');
+    sigEl.textContent = j.sigma_status || 'σ —';
+    sigEl.className = j.sigma_fallback ? 'fallback' : '';
     const xs = j.xs || [];
     probChart.data.datasets[0].data = toXY(xs, j.theo_up || []);
     probChart.data.datasets[1].data = toXY(xs, j.up_mid || []);
@@ -267,10 +274,15 @@ def main() -> int:
     dq_sy: deque[float] = deque(maxlen=args.max_points)
     last_bucket: int | None = None
     slug = ""
+    latest_sigma = float("nan")
+    latest_sigma_window_full = False
+    latest_sigma_slug_ready = False
+    latest_sigma_fallback = True
     lock = threading.Lock()
 
     def tail_loop() -> None:
-        nonlocal last_bucket, slug
+        nonlocal last_bucket, slug, latest_sigma, latest_sigma_window_full
+        nonlocal latest_sigma_slug_ready, latest_sigma_fallback
         while True:
             for line in tail_s.lines_since_last():
                 row = parse_series_line(line)
@@ -284,12 +296,21 @@ def main() -> int:
                             q.clear()
                         clear_trade_markers()
                         backfill_trades(last_bucket)
+                        latest_sigma = float("nan")
+                        latest_sigma_window_full = False
+                        latest_sigma_slug_ready = False
+                        latest_sigma_fallback = True
                     _, rs = rel_s_in_bucket(row["wall_ms"])
                     dq_x.append(rs)
                     dq_tu.append(row["theo_up"])
                     dq_um.append(row["up_mid"])
                     dq_td.append(row["theo_dn"])
                     dq_dm.append(row["dn_mid"])
+                    if finite(row.get("sigma", float("nan"))):
+                        latest_sigma = float(row["sigma"])
+                    latest_sigma_window_full = bool(row.get("sigma_vol_window_full", False))
+                    latest_sigma_slug_ready = bool(row.get("sigma_slug_ready", False))
+                    latest_sigma_fallback = bool(row.get("sigma_fallback", not latest_sigma_slug_ready))
                     if not use_chain and finite(row["S"]):
                         dq_sx.append(rs)
                         dq_sy.append(row["S"])
@@ -329,9 +350,20 @@ def main() -> int:
                 btc_x = list(dq_sx)
                 btc_y = list(dq_sy)
                 btc_label = "BTC (series S)" if btc_y else ""
+            sigma_status = format_sigma_status(
+                latest_sigma,
+                window_full=latest_sigma_window_full,
+                slug_ready=latest_sigma_slug_ready,
+                fallback=latest_sigma_fallback,
+            )
             return json.dumps(
                 {
                     "slug": slug,
+                    "sigma": latest_sigma if finite(latest_sigma) else None,
+                    "sigma_vol_window_full": latest_sigma_window_full,
+                    "sigma_slug_ready": latest_sigma_slug_ready,
+                    "sigma_fallback": latest_sigma_fallback,
+                    "sigma_status": sigma_status,
                     "xs": list(dq_x),
                     "theo_up": list(dq_tu),
                     "up_mid": list(dq_um),

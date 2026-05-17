@@ -32,6 +32,7 @@ if str(_TOOLS_DIR) not in sys.path:
 from live_plot_common import (
     JsonlTail,
     finite,
+    format_sigma_status,
     iter_trade_markers_from_file,
     parse_chainlink_line,
     parse_series_line,
@@ -149,6 +150,10 @@ def main() -> int:
     dq_td: deque[float] = deque(maxlen=args.max_points)
     dq_dm: deque[float] = deque(maxlen=args.max_points)
     cur_slug = ""
+    latest_sigma = float("nan")
+    latest_sigma_window_full = False
+    latest_sigma_slug_ready = False
+    latest_sigma_fallback = True
 
     (ln_theo_u,) = ax_up.plot([], [], "b--", lw=1.4, label="理论 Up (theo_up)")
     (ln_mid_u,) = ax_up.plot([], [], color="tab:orange", lw=1.2, label="市场 Up mid")
@@ -185,7 +190,8 @@ def main() -> int:
     last_bucket_key: int | None = None
 
     def reset_bucket(new_bucket: int, slug: str) -> None:
-        nonlocal last_bucket_key
+        nonlocal last_bucket_key, latest_sigma, latest_sigma_window_full
+        nonlocal latest_sigma_slug_ready, latest_sigma_fallback
         last_bucket_key = new_bucket
         marker_seen.clear()
         bu_x.clear()
@@ -208,6 +214,10 @@ def main() -> int:
         fig1.suptitle(slug, fontsize=11)
         src = "Chainlink" if use_chain else "series S"
         fig2.suptitle(f"{slug} | BTC ({src})", fontsize=11)
+        latest_sigma = float("nan")
+        latest_sigma_window_full = False
+        latest_sigma_slug_ready = False
+        latest_sigma_fallback = True
 
     plt.ion()
     fig1.show()
@@ -240,6 +250,11 @@ def main() -> int:
             dq_um.append(row["up_mid"])
             dq_td.append(row["theo_dn"])
             dq_dm.append(row["dn_mid"])
+            if finite(row.get("sigma", float("nan"))):
+                latest_sigma = float(row["sigma"])
+            latest_sigma_window_full = bool(row.get("sigma_vol_window_full", False))
+            latest_sigma_slug_ready = bool(row.get("sigma_slug_ready", False))
+            latest_sigma_fallback = bool(row.get("sigma_fallback", not latest_sigma_slug_ready))
             if not use_chain and finite(row["S"]):
                 dq_sx.append(rs)
                 dq_ss.append(row["S"])
@@ -297,6 +312,15 @@ def main() -> int:
             ax_b.legend(loc="upper left", fontsize=8)
         elif cur_slug:
             ax_b.set_title("(等待 BTC 价位数据…)", fontsize=9)
+
+        if cur_slug:
+            sig_line = format_sigma_status(
+                latest_sigma,
+                window_full=latest_sigma_window_full,
+                slug_ready=latest_sigma_slug_ready,
+                fallback=latest_sigma_fallback,
+            )
+            fig1.suptitle(f"{cur_slug}\n{sig_line}", fontsize=10)
 
         fig1.canvas.draw_idle()
         fig1.canvas.flush_events()

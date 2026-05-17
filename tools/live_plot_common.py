@@ -78,9 +78,36 @@ def parse_series_line(line: str) -> dict | None:
             "up_mid": float(up.get("mid", float("nan"))),
             "dn_mid": float(dn.get("mid", float("nan"))),
             "S": float(r.get("S", float("nan"))),
+            "sigma": float(r.get("sigma", float("nan"))),
+            "sigma_vol_window_full": bool(r.get("sigma_vol_window_full", False)),
+            "sigma_slug_ready": bool(r.get("sigma_slug_ready", False)),
+            "sigma_fallback": bool(r.get("sigma_fallback", False)),
         }
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def format_sigma_status(
+    sigma: float,
+    *,
+    window_full: bool = False,
+    slug_ready: bool = False,
+    fallback: bool | None = None,
+) -> str:
+    """Human-readable σ line for web / matplotlib dashboards."""
+    if fallback is None:
+        fallback = not slug_ready
+    sig_s = f"{sigma:.4f}" if finite(sigma) else "—"
+    parts = [f"σ = {sig_s}"]
+    if slug_ready:
+        parts.append("本窗 σ 已算")
+    elif fallback:
+        parts.append("σ fallback")
+    if window_full:
+        parts.append("1h 窗口已满")
+    else:
+        parts.append("1h 窗口未满")
+    return " · ".join(parts)
 
 
 def parse_chainlink_line(line: str) -> dict | None:

@@ -1699,6 +1699,19 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["S"] = S;
         row["K"] = K;
         row["sigma"] = sigma_use;
+        {
+          bool window_full = false;
+          bool slug_sigma_ready = have_sigma;
+          const std::int64_t anchor_ms = active_epoch * 1000LL;
+          std::lock_guard<std::mutex> lk(hot.mu);
+          slug_sigma_ready = hot.have_sigma;
+          if (!hot.bin_hist.empty()) {
+            window_full = hot.bin_hist.front().first <= anchor_ms - 3600 * 1000LL;
+          }
+          row["sigma_fallback"] = !slug_sigma_ready;
+          row["sigma_vol_window_full"] = window_full;
+          row["sigma_slug_ready"] = slug_sigma_ready;
+        }
         row["theo_up"] = p_up;
         row["theo_down"] = p_dn;
         row["up"] = {{"bid", up_bid}, {"ask", up_ask}, {"mid", up_mid}};
