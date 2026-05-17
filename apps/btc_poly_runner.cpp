@@ -390,6 +390,19 @@ struct HotState {
 
 static inline double clamp01(double x) { return (x < 0.0) ? 0.0 : (x > 1.0 ? 1.0 : x); }
 
+static inline double clamp_sigma(double s, double lo, double hi) {
+  if (!std::isfinite(s)) {
+    return lo;
+  }
+  if (s < lo) {
+    return lo;
+  }
+  if (s > hi) {
+    return hi;
+  }
+  return s;
+}
+
 static inline double normal_cdf(double x) { return 0.5 * std::erfc(-x / std::sqrt(2.0)); }
 
 static inline double digital_call_prob(double S, double K, double T_years, double sigma, double r) {
@@ -900,8 +913,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
 
   // Defaults: align with data/backtest.ipynb cell 5–7 (override via CLI).
   const double r = 0.035;
-  const double sigma_min = 0.05;  // guardrail: ignore unrealistically tiny realized sigma
-  const double sigma_max = 5.0;   // guardrail: ignore absurd spikes
+  const double sigma_rv_min = 0.05;  // realized/GARCH estimate must be in range to accept
+  const double sigma_rv_max = 5.0;
+  double sigma_clamp_min = 0.15;  // theo pricing: clamp final σ to [min, max]
+  double sigma_clamp_max = 0.2;
   double sigma_fallback = 0.15;
   std::int64_t sigma_step_ms = 300;
   /// `slug_fixed` (default): σ at bucket anchor, constant for the 5m slug (backtest SIGMA_MODE=slug_fixed).
@@ -998,6 +1013,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       out_prefix = argv[++i];
     } else if (a == "--sigma" && i + 1 < argc) {
       sigma_fallback = std::stod(argv[++i]);
+    } else if (a == "--sigma-clamp-min" && i + 1 < argc) {
+      sigma_clamp_min = std::stod(argv[++i]);
+    } else if (a == "--sigma-clamp-max" && i + 1 < argc) {
+      sigma_clamp_max = std::stod(argv[++i]);
     } else if (a == "--sigma-step-ms" && i + 1 < argc) {
       sigma_step_ms = std::stoll(argv[++i]);
     } else if (a == "--sigma-model" && i + 1 < argc) {
@@ -1111,6 +1130,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                    "  --buy-ask-max P            (default 0.9)\n"
                    "  --no-buy-ask-range         allow BUY at any ask (restores min-ask 0.02 guard only)\n"
                    "  --sigma S                  (fallback when bucket sigma missing)\n"
+                   "  --sigma-clamp-min S        (clamp σ used in theo; default 0.15)\n"
+                   "  --sigma-clamp-max S        (default 0.2)\n"
                    "  --sigma-step-ms N          (resample step for GARCH input + realized fallback)\n"
                    "  --sigma-model slug_fixed|fixed|rolling|realized|rv|constant|garch\n"
                    "                             (default slug_fixed: σ at bucket start, constant per slug;\n"
@@ -1236,7 +1257,15 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     }
     std::cerr << "[" << src_tag << "] sigma vol mode: " << sigma_mode_str
               << (sigma_try_garch ? " + GARCH at bucket init" : "") << "\n";
+    std::cerr << "[" << src_tag << "] sigma theo clamp: [" << sigma_clamp_min << ", "
+              << sigma_clamp_max << "] (fallback=" << sigma_fallback << ")\n";
   }
+  if (sigma_clamp_min <= 0.0 || sigma_clamp_max <= 0.0 || sigma_clamp_min > sigma_clamp_max) {
+    { ll::io::SyncCerrLock _;
+      std::cerr << "sigma clamp range invalid: need 0 < sigma-clamp-min <= sigma-clamp-max\n"; }
+    return 2;
+  }
+  sigma_fallback = clamp_sigma(sigma_fallback, sigma_clamp_min, sigma_clamp_max);
     if (stop_loss_frac > 0.0) {
       std::cerr << "[" << src_tag << "] stop loss: unrealized PnL / cost_basis <= -" << stop_loss_frac
                 << "; exit uses FAK + retry until CLOB balance=0\n";
@@ -1558,8 +1587,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     const std::int64_t exp_wall_ms = (active_epoch + 300) * 1000;
     const double rem_s = std::max(0.001, (exp_wall_ms - bin_wall_ms) / 1000.0);
     const double T_years = rem_s / (365.0 * 24.0 * 3600.0);
-    const double sigma_use = have_sigma ? sigma_bucket : sigma_fallback;
+    const double sigma_raw = have_sigma ? sigma_bucket : sigma_fallback;
+    const double sigma_use = clamp_sigma(sigma_raw, sigma_clamp_min, sigma_clamp_max);
     const bool sigma_is_fallback = !have_sigma;
+    const bool sigma_was_clamped =
+        std::isfinite(sigma_raw) && (sigma_raw < sigma_clamp_min - 1e-12 || sigma_raw > sigma_clamp_max + 1e-12);
     const double p_up = digital_call_prob(S, K, T_years, sigma_use, r);
     const double p_dn = digital_call_prob(K, S, T_years, sigma_use, r);  // placeholder; overwritten below
     const double d2 = (std::log(S / K) + (r - 0.5 * sigma_use * sigma_use) * T_years) /
@@ -1764,6 +1796,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["K"] = K;
         row["T_s"] = rem_s;
         row["sigma"] = sigma_use;
+        if (sigma_was_clamped) {
+          row["sigma_raw"] = sigma_raw;
+          row["sigma_clamped"] = true;
+        }
         append_sigma_trade_fields(row, active_epoch, bin_wall_ms);
         row["theo"] = theo;
         row["bid"] = (want_up ? up_bid : dn_bid);
@@ -2149,7 +2185,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     const std::int64_t exp_wall_ms = (active_epoch + 300) * 1000;
     const double rem_s = std::max(0.001, (exp_wall_ms - bin_wall_ms) / 1000.0);
     const double T_years = rem_s / (365.0 * 24.0 * 3600.0);
-    const double sigma_use = have_sigma ? sigma_bucket : sigma_fallback;
+    const double sigma_raw = have_sigma ? sigma_bucket : sigma_fallback;
+    const double sigma_use = clamp_sigma(sigma_raw, sigma_clamp_min, sigma_clamp_max);
     const double d2 = (std::log(S / K) + (r - 0.5 * sigma_use * sigma_use) * T_years) /
                       (sigma_use * std::sqrt(T_years));
     const double disc = std::exp(-r * T_years);
@@ -2174,6 +2211,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["S"] = S;
         row["K"] = K;
         row["sigma"] = sigma_use;
+        if (std::isfinite(sigma_raw) &&
+            (sigma_raw < sigma_clamp_min - 1e-12 || sigma_raw > sigma_clamp_max + 1e-12)) {
+          row["sigma_raw"] = sigma_raw;
+          row["sigma_clamped"] = true;
+        }
         {
           bool window_full = false;
           bool slug_sigma_ready = have_sigma;
@@ -2648,7 +2690,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           if (sigma_vol_mode == SigmaVolMode::Constant && hot.active_epoch >= 0 &&
               wall_s >= hot.active_epoch) {
             hot.have_sigma = true;
-            hot.sigma_bucket = sigma_fallback;
+            hot.sigma_bucket = clamp_sigma(sigma_fallback, sigma_clamp_min, sigma_clamp_max);
           } else if (hot.active_epoch >= 0 && !hot.have_sigma && wall_s >= hot.active_epoch) {
             need_sigma = true;
             if (sigma_vol_mode == SigmaVolMode::SlugFixed) {
@@ -2676,7 +2718,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             std::string gerr;
             std::int64_t glat = -1;
             if (live_ex.query_garch_sigma(resampled_mids, sigma_step_ms, &garch_sig, &gerr, &glat)) {
-              if (std::isfinite(garch_sig) && garch_sig >= sigma_min && garch_sig <= sigma_max) {
+              if (std::isfinite(garch_sig) && garch_sig >= sigma_rv_min && garch_sig <= sigma_rv_max) {
                 final_sig = garch_sig;
                 {
                   ll::io::SyncCerrLock _;
@@ -2702,19 +2744,23 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           }
 #endif
           if (!std::isfinite(final_sig)) {
-            realized_vol_from_resampled_mids(resampled_mids, sigma_step_ms, sigma_min, sigma_max,
+            realized_vol_from_resampled_mids(resampled_mids, sigma_step_ms, sigma_rv_min, sigma_rv_max,
                                                &final_sig);
           }
 
           {
             std::lock_guard<std::mutex> lk(hot.mu);
-            if (std::isfinite(final_sig) && final_sig >= sigma_min && final_sig <= sigma_max) {
+            if (std::isfinite(final_sig) && final_sig >= sigma_rv_min && final_sig <= sigma_rv_max) {
               hot.have_sigma = true;
-              hot.sigma_bucket = final_sig;
+              const double sig_clamped = clamp_sigma(final_sig, sigma_clamp_min, sigma_clamp_max);
+              hot.sigma_bucket = sig_clamped;
               if (sigma_vol_mode == SigmaVolMode::SlugFixed) {
                 ll::io::SyncCerrLock _;
-                std::cerr << log_pfx << " slug_fixed sigma=" << final_sig
-                          << " slug=" << hot.slug << " anchor_wall_ms=" << sigma_anchor_wall_ms
+                std::cerr << log_pfx << " slug_fixed sigma=" << sig_clamped;
+                if (std::fabs(sig_clamped - final_sig) > 1e-12) {
+                  std::cerr << " raw=" << final_sig;
+                }
+                std::cerr << " slug=" << hot.slug << " anchor_wall_ms=" << sigma_anchor_wall_ms
                           << "\n";
               }
             } else {
@@ -2747,11 +2793,11 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           }
           if (in_bucket && rv_full_hour && rv_mids.size() >= 10) {
             double rv_sig = std::numeric_limits<double>::quiet_NaN();
-            if (realized_vol_from_resampled_mids(rv_mids, sigma_step_ms, sigma_min, sigma_max,
+            if (realized_vol_from_resampled_mids(rv_mids, sigma_step_ms, sigma_rv_min, sigma_rv_max,
                                                  &rv_sig)) {
               std::lock_guard<std::mutex> lk(hot.mu);
               hot.have_sigma = true;
-              hot.sigma_bucket = rv_sig;
+              hot.sigma_bucket = clamp_sigma(rv_sig, sigma_clamp_min, sigma_clamp_max);
             }
           }
         }
