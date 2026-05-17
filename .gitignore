@@ -1,13 +1,33 @@
+# CMake / build artifacts
 build/
-# CMake out-of-tree presets: build-dbg, build-jthread, build-tsan, build-asan, ...
+build[0-9]*/
 build-*/
 build_fresh/
 _build_check/
 cmake-build-*/
+compile_commands.json
+
+# CTest scratch
+Testing/
+
+# Local runtime data & secrets
 data/
 .env
 .env.*
 !.env.example
 *.log
+/out.jsonl
+account.txt
+=
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS / IDE
 .DS_Store
-compile_commands.json
+.idea/
+.vscode/

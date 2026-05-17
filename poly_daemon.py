@@ -161,9 +161,29 @@ def main():
                     )
                     continue
 
-                moa = MarketOrderArgsV2(token_id=token_id, amount=amount, side=side, order_type=ot)
+                price = float(req.get("price", 0) or 0)
+                moa = MarketOrderArgsV2(
+                    token_id=token_id,
+                    amount=amount,
+                    side=side,
+                    price=price,
+                    order_type=ot,
+                )
                 resp = client.create_and_post_market_order(moa, order_type=ot)
-                reply({"ok": True, "cmd": cmd, "resp": resp, "ts_ms": int(time.time() * 1000)})
+                order_id = ""
+                if isinstance(resp, dict):
+                    order_id = (
+                        str(resp.get("orderID") or resp.get("order_id") or resp.get("orderId") or "")
+                    )
+                reply(
+                    {
+                        "ok": True,
+                        "cmd": cmd,
+                        "resp": resp,
+                        "order_id": order_id,
+                        "ts_ms": int(time.time() * 1000),
+                    }
+                )
                 continue
 
             if cmd == "place_order":
@@ -233,6 +253,20 @@ def main():
                         "cmd": cmd,
                         "balance": balance_shares,
                         "raw": raw,
+                        "ts_ms": int(time.time() * 1000),
+                    }
+                )
+                continue
+
+            if cmd == "get_order":
+                order_id = str(req["order_id"])
+                resp = client.get_order(order_id)
+                reply(
+                    {
+                        "ok": True,
+                        "cmd": cmd,
+                        "order": resp,
+                        "resp": resp,
                         "ts_ms": int(time.time() * 1000),
                     }
                 )

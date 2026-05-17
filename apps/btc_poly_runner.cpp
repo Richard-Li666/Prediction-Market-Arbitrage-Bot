@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <csignal>
@@ -18,6 +19,7 @@
 #include <queue>
 #include <string>
 #include <thread>
+#include <chrono>
 #include <vector>
 
 #include <curl/curl.h>
@@ -524,6 +526,334 @@ static inline double poly_taker_fee(double notional_usdc, double price, double f
   return (fee >= 1e-5) ? fee : 0.0;
 }
 
+#ifdef LL_ENABLE_LIVE_TRADER
+static void sleep_ms(std::int64_t ms) {
+  if (ms > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  }
+}
+
+static std::string clob_order_status_upper(const nlohmann::json& order) {
+  std::string st;
+  if (order.contains("status") && order["status"].is_string()) {
+    st = order["status"].get<std::string>();
+  } else if (order.contains("order_status") && order["order_status"].is_string()) {
+    st = order["order_status"].get<std::string>();
+  }
+  for (char& c : st) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return st;
+}
+
+static bool clob_order_status_terminal(const std::string& st_upper) {
+  return st_upper == "MATCHED" || st_upper == "CANCELED" || st_upper == "CANCELLED" ||
+         st_upper == "FILLED" || st_upper == "EXECUTED";
+}
+
+static bool clob_json_to_double(const nlohmann::json& v, double* out) {
+  if (!out) {
+    return false;
+  }
+  if (v.is_number()) {
+    *out = v.get<double>();
+    return std::isfinite(*out);
+  }
+  if (v.is_string()) {
+    try {
+      *out = std::stod(v.get<std::string>());
+      return std::isfinite(*out);
+    } catch (...) {
+      return false;
+    }
+  }
+  return false;
+}
+
+/// CLOB fixed-point amounts (USDC / shares) are often scaled by 1e6.
+static double clob_decode_amount(double raw) {
+  if (!std::isfinite(raw)) {
+    return raw;
+  }
+  if (raw >= 1.0e4 && std::fabs(raw - std::round(raw)) < 1e-6) {
+    return raw / 1.0e6;
+  }
+  return raw;
+}
+
+static bool clob_json_amount_field(const nlohmann::json& obj, const char* key, double* out) {
+  if (!obj.contains(key)) {
+    return false;
+  }
+  double raw = 0.0;
+  if (!clob_json_to_double(obj.at(key), &raw)) {
+    return false;
+  }
+  *out = clob_decode_amount(raw);
+  return std::isfinite(*out) && *out >= 0.0;
+}
+
+static bool clob_order_size_matched_shares(const nlohmann::json& order, double* out_shares) {
+  if (!out_shares) {
+    return false;
+  }
+  double sm = 0.0;
+  if (!clob_json_amount_field(order, "size_matched", &sm) &&
+      !clob_json_amount_field(order, "sizeMatched", &sm)) {
+    return false;
+  }
+  if (sm <= 0.0) {
+    return false;
+  }
+  *out_shares = sm;
+  return true;
+}
+
+static bool try_market_buy_fill_from_post_resp(const nlohmann::json& submit_top, double* out_cost_usd,
+                                               double* out_shares) {
+  const nlohmann::json* body = nullptr;
+  if (submit_top.contains("resp") && submit_top["resp"].is_object()) {
+    body = &submit_top["resp"];
+  } else if (submit_top.is_object()) {
+    body = &submit_top;
+  }
+  if (!body) {
+    return false;
+  }
+  double making = 0.0;
+  double taking = 0.0;
+  const bool have_making = clob_json_amount_field(*body, "makingAmount", &making) ||
+                           clob_json_amount_field(*body, "making_amount", &making);
+  const bool have_taking = clob_json_amount_field(*body, "takingAmount", &taking) ||
+                           clob_json_amount_field(*body, "taking_amount", &taking);
+  if (!have_making || !have_taking || making <= 0.0 || taking <= 0.0) {
+    return false;
+  }
+  // BUY: pay USDC (making), receive outcome shares (taking). Swap if fields appear reversed.
+  double cost = making;
+  double shares = taking;
+  if (cost <= 1.0 && shares > 1.0) {
+    std::swap(cost, shares);
+  }
+  if (shares <= 0.0 || cost <= 0.0) {
+    return false;
+  }
+  const double px = cost / shares;
+  if (px < 0.001 || px > 0.999) {
+    std::swap(cost, shares);
+    if (shares <= 0.0 || cost <= 0.0) {
+      return false;
+    }
+    const double px2 = cost / shares;
+    if (px2 < 0.001 || px2 > 0.999) {
+      return false;
+    }
+  }
+  *out_cost_usd = cost;
+  *out_shares = shares;
+  return true;
+}
+
+struct LiveMarketBuyFill {
+  bool ok{false};
+  double fill_qty{0.0};
+  double fill_avg_price{0.0};
+  double cost_usd{0.0};
+  double fee_usd{0.0};
+  bool fill_price_estimated{false};
+  std::string last_error;
+};
+
+static LiveMarketBuyFill live_resolve_market_buy_fill(ll::execution::LiveExecutor& live_ex,
+                                                      const std::string& token_id,
+                                                      const std::string& order_id,
+                                                      double balance_before_shares,
+                                                      double spend_target_usd, double signal_ask,
+                                                      double fee_rate,
+                                                      const nlohmann::json& submit_resp) {
+  constexpr std::int64_t kOrderPollMs = 150;
+  constexpr int kMaxOrderPolls = 20;
+  constexpr double kShareEps = 1e-6;
+
+  LiveMarketBuyFill out;
+  double cost_usd = std::numeric_limits<double>::quiet_NaN();
+  double fill_qty = std::numeric_limits<double>::quiet_NaN();
+
+  if (try_market_buy_fill_from_post_resp(submit_resp, &cost_usd, &fill_qty)) {
+    out.fill_price_estimated = false;
+  }
+
+  if (!order_id.empty()) {
+    for (int pi = 0; pi < kMaxOrderPolls; ++pi) {
+      nlohmann::json order;
+      std::string oerr;
+      if (live_ex.query_order(order_id, &order, &oerr, nullptr)) {
+        const std::string st = clob_order_status_upper(order);
+        double matched_shares = 0.0;
+        const bool have_matched = clob_order_size_matched_shares(order, &matched_shares);
+        if (have_matched && matched_shares > kShareEps) {
+          if (!std::isfinite(fill_qty) || fill_qty <= 0.0) {
+            fill_qty = matched_shares;
+          }
+          if (!std::isfinite(cost_usd) || cost_usd <= 0.0) {
+            double order_px = 0.0;
+            if (clob_json_amount_field(order, "price", &order_px) && order_px > 0.0 &&
+                order_px < 1.0) {
+              cost_usd = fill_qty * order_px;
+              out.fill_price_estimated = true;
+            }
+          }
+        }
+        if (clob_order_status_terminal(st) && have_matched) {
+          break;
+        }
+        if (clob_order_status_terminal(st) && !have_matched) {
+          break;
+        }
+      } else if (!oerr.empty()) {
+        out.last_error = oerr;
+      }
+      sleep_ms(kOrderPollMs);
+    }
+  } else {
+    sleep_ms(kOrderPollMs);
+  }
+
+  double balance_after = balance_before_shares;
+  std::string qerr;
+  if (live_ex.query_conditional_balance(token_id, &balance_after, &qerr, nullptr)) {
+    const double delta = balance_after - balance_before_shares;
+    if (delta > kShareEps) {
+      fill_qty = delta;
+    }
+  } else if (!qerr.empty()) {
+    out.last_error = qerr;
+  }
+
+  if (!std::isfinite(fill_qty) || fill_qty <= kShareEps) {
+    if (out.last_error.empty()) {
+      out.last_error = "no shares filled (balance delta and order match empty)";
+    }
+    return out;
+  }
+
+  if (!std::isfinite(cost_usd) || cost_usd <= 0.0) {
+    if (spend_target_usd > 0.0 && signal_ask > 0.0) {
+      const double expected_qty = spend_target_usd / signal_ask;
+      if (expected_qty > 0.0 && fill_qty >= expected_qty * 0.98) {
+        cost_usd = spend_target_usd;
+        out.fill_price_estimated = true;
+      } else {
+        cost_usd = fill_qty * signal_ask;
+        out.fill_price_estimated = true;
+      }
+    } else {
+      out.last_error = "cannot infer buy cost (missing CLOB amounts)";
+      return out;
+    }
+  }
+
+  out.fill_qty = fill_qty;
+  out.cost_usd = cost_usd;
+  out.fill_avg_price = cost_usd / fill_qty;
+  out.fee_usd = poly_taker_fee(cost_usd, out.fill_avg_price, fee_rate);
+  out.ok = true;
+  return out;
+}
+
+struct StopSellUntilFlatResult {
+  bool flat{false};
+  double total_proceeds{0.0};
+  double total_fee{0.0};
+  double final_balance{0.0};
+  double last_sell_qty{0.0};
+  int attempts{0};
+  std::string last_error;
+};
+
+static StopSellUntilFlatResult live_stop_sell_until_flat(ll::execution::LiveExecutor& live_ex,
+                                                        const std::string& token_id,
+                                                        double mark_bid, double fee_rate) {
+  constexpr int kMaxAttempts = 30;
+  constexpr std::int64_t kRetryMs = 300;
+  constexpr std::int64_t kOrderPollMs = 150;
+  constexpr int kMaxOrderPolls = 15;
+  constexpr double kFlatEps = 1e-6;
+
+  StopSellUntilFlatResult out;
+  const double worst_px = std::max(0.01, mark_bid);
+
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+    out.attempts = attempt + 1;
+    double bal = 0.0;
+    std::string qerr;
+    if (!live_ex.query_conditional_balance(token_id, &bal, &qerr, nullptr)) {
+      out.last_error = qerr;
+      sleep_ms(kRetryMs);
+      continue;
+    }
+    out.final_balance = bal;
+    if (bal <= kFlatEps) {
+      out.flat = true;
+      return out;
+    }
+
+    const double bal_before = bal;
+    ll::execution::OrderIntent oi;
+    oi.market_token_id = token_id;
+    oi.side = "SELL";
+    oi.market_order = true;
+    oi.market_order_type = "FAK";
+    oi.market_worst_price = worst_px;
+    oi.qty = bal_before;
+
+    std::string errmsg;
+    std::string oid;
+    if (!live_ex.submit(oi, &errmsg, &oid, nullptr)) {
+      out.last_error = errmsg;
+      sleep_ms(kRetryMs);
+      continue;
+    }
+
+    if (!oid.empty()) {
+      for (int pi = 0; pi < kMaxOrderPolls; ++pi) {
+        nlohmann::json order;
+        std::string oerr;
+        if (live_ex.query_order(oid, &order, &oerr, nullptr)) {
+          if (clob_order_status_terminal(clob_order_status_upper(order))) {
+            break;
+          }
+        }
+        sleep_ms(kOrderPollMs);
+      }
+    } else {
+      sleep_ms(kOrderPollMs);
+    }
+
+    double bal_after = bal_before;
+    if (!live_ex.query_conditional_balance(token_id, &bal_after, &qerr, nullptr)) {
+      out.last_error = qerr;
+      sleep_ms(kRetryMs);
+      continue;
+    }
+    out.final_balance = bal_after;
+    const double sold = std::max(0.0, bal_before - bal_after);
+    out.last_sell_qty = sold;
+    if (sold > kFlatEps) {
+      const double proceeds = sold * mark_bid;
+      out.total_proceeds += proceeds;
+      out.total_fee += poly_taker_fee(proceeds, mark_bid, fee_rate);
+    }
+    if (bal_after <= kFlatEps) {
+      out.flat = true;
+      return out;
+    }
+    sleep_ms(kRetryMs);
+  }
+  return out;
+}
+#endif
+
 bool parse_epoch_from_confirmed_slug(const std::string& slug, std::int64_t* out_epoch) {
   static constexpr char kPrefix[] = "btc-updown-5m-";
   constexpr std::size_t plen = sizeof(kPrefix) - 1;
@@ -909,7 +1239,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
   }
     if (stop_loss_frac > 0.0) {
       std::cerr << "[" << src_tag << "] stop loss: unrealized PnL / cost_basis <= -" << stop_loss_frac
-                << "\n";
+                << "; exit uses FAK + retry until CLOB balance=0\n";
     }
     std::cerr << "[" << src_tag << "] SELL when bid >= theo - close_eps - close_early_threshold"
               << " (close_eps=" << close_eps << " close_early_threshold=" << close_early_threshold << ")\n";
@@ -1032,6 +1362,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     std::string slug;
     double qty{0.0};  // fractional shares allowed
     double pos_cost_basis{0.0};  // buy cost + fee (backtest pos_cost_basis)
+    /// Actual average fill price per share (live: from CLOB; paper: signal ask).
+    double entry_fill_price{0.0};
     double cash{0.0};
     bool pending{false};
     std::string pending_action; // BUY/SELL
@@ -1040,6 +1372,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
     std::int64_t due_ns{0};
     bool risk_stop{false};
     std::int64_t cooldown_until_ns{0};
+    /// Stop-loss FAK sell did not flatten; keep scheduling SELL until CLOB balance is 0.
+    bool stop_sell_retry{false};
   } paper;
   paper.cash = initial_cash;
   constexpr std::int64_t kCooldownNs = 10'000'000'000LL;  // 10 seconds
@@ -1176,13 +1510,16 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       stop = stop_loss_signal(dn_bid, paper.qty);
       take_profit = dn_bid >= close_floor_dn;
     }
+    if (paper.stop_sell_retry) {
+      stop = true;
+    }
     if (!stop && !take_profit) {
       return;
     }
     paper.pending = true;
     paper.pending_action = "SELL";
     paper.pending_side = paper.side;
-    paper.pending_exit_reason = stop ? "stop_loss" : "take_profit";
+    paper.pending_exit_reason = (stop || paper.stop_sell_retry) ? "stop_loss" : "take_profit";
     paper.due_ns = now_ns + lat_ns;
   };
 
@@ -1285,17 +1622,37 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         return;
       }
       std::int64_t daemon_submit_latency_ns = -1;
+      double fill_qty = qty;
+      double fill_cost = cost;
+      double fill_fee = fee;
+      double fill_avg_price = ask;
+      bool fill_price_estimated = false;
+      const double signal_ask = ask;
 #ifdef LL_ENABLE_LIVE_TRADER
       if (live_execution) {
+        const std::string token_id = want_up ? feed_up.token_id() : feed_down.token_id();
+        double bal_before = 0.0;
+        std::string bal_err;
+        if (!live_ex.query_conditional_balance(token_id, &bal_before, &bal_err, nullptr)) {
+          {
+            ll::io::SyncCerrLock _;
+            std::cerr << log_pfx << " BUY balance query failed: " << bal_err << "\n";
+          }
+          paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
+          paper.pending = false;
+          return;
+        }
         ll::execution::OrderIntent oi;
-        oi.market_token_id = want_up ? feed_up.token_id() : feed_down.token_id();
+        oi.market_token_id = token_id;
         oi.side = "BUY";
         oi.market_order = true;
         oi.qty = spend;
+        oi.market_worst_price = ask;
         oi.mono_ns = now_ns;
         std::string errmsg;
         std::string oid;
-        if (!live_ex.submit(oi, &errmsg, &oid, &daemon_submit_latency_ns)) {
+        nlohmann::json submit_resp;
+        if (!live_ex.submit(oi, &errmsg, &oid, &daemon_submit_latency_ns, &submit_resp)) {
           {
             ll::io::SyncCerrLock _;
             std::cerr << "[live] BUY submit failed: " << errmsg;
@@ -1318,7 +1675,8 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             row["local_ts_wall_ms"] = ll::core::system_ms();
             row["local_ts_mono_ns"] = now_ns;
             row["theo"] = theo;
-            row["ask"] = ask;
+            row["signal_ask"] = signal_ask;
+            row["ask"] = signal_ask;
             row["edge"] = edge;
             row["qty"] = qty;
             row["spend"] = spend;
@@ -1332,15 +1690,56 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           paper.pending = false;
           return;
         }
+        const LiveMarketBuyFill bf = live_resolve_market_buy_fill(
+            live_ex, token_id, oid, bal_before, spend, signal_ask, fee_rate, submit_resp);
+        if (!bf.ok) {
+          {
+            ll::io::SyncCerrLock _;
+            std::cerr << log_pfx << " BUY fill unresolved";
+            if (!bf.last_error.empty()) {
+              std::cerr << ": " << bf.last_error;
+            }
+            std::cerr << "\n";
+          }
+          if (trades_writer.ok()) {
+            nlohmann::json row;
+            row["schema_version"] = 1;
+            row["source"] = src_tag;
+            row["event_type"] = "error";
+            row["action"] = "BUY_NO_FILL";
+            row["slug"] = slug;
+            row["side"] = paper.pending_side;
+            row["token_id"] = token_id;
+            row["order_id"] = oid;
+            row["signal_ask"] = signal_ask;
+            row["ask"] = signal_ask;
+            row["spend"] = spend;
+            if (!bf.last_error.empty()) {
+              row["error"] = bf.last_error;
+            }
+            row["local_ts_wall_ms"] = ll::core::system_ms();
+            row["local_ts_mono_ns"] = now_ns;
+            trades_writer.append(row);
+          }
+          paper.cooldown_until_ns = ll::core::steady_ns() + kCooldownNs;
+          paper.pending = false;
+          return;
+        }
+        fill_qty = bf.fill_qty;
+        fill_cost = bf.cost_usd;
+        fill_fee = bf.fee_usd;
+        fill_avg_price = bf.fill_avg_price;
+        fill_price_estimated = bf.fill_price_estimated;
       }
 #endif
-      paper.cash -= (cost + fee);
+      paper.cash -= (fill_cost + fill_fee);
       paper.have_pos = true;
       paper.side = paper.pending_side;
       paper.slug = slug;
       paper.token_id = want_up ? feed_up.token_id() : feed_down.token_id();
-      paper.qty = qty;
-      paper.pos_cost_basis = cost + fee;
+      paper.qty = fill_qty;
+      paper.entry_fill_price = fill_avg_price;
+      paper.pos_cost_basis = fill_cost + fill_fee;
       {
         double eq = paper.cash;
         if (paper.have_pos) {
@@ -1368,15 +1767,20 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         append_sigma_trade_fields(row, active_epoch, bin_wall_ms);
         row["theo"] = theo;
         row["bid"] = (want_up ? up_bid : dn_bid);
-        row["ask"] = ask;
+        row["signal_ask"] = signal_ask;
+        row["ask"] = signal_ask;
+        row["fill_price"] = fill_avg_price;
+        row["entry_fill_price"] = fill_avg_price;
         row["mid"] = mid;
         row["edge"] = edge;
-        row["qty"] = qty;
-        row["cost"] = cost;
-        row["fee"] = fee;
+        row["qty"] = fill_qty;
+        row["cost"] = fill_cost;
+        row["fee"] = fill_fee;
         row["spend_target"] = spend_target;
-        row["spend"] = cost;
-        row["cash_before"] = (paper.cash + cost + fee);
+        row["spend"] = fill_cost;
+        row["fill_price_estimated"] = fill_price_estimated;
+        row["pos_cost_basis"] = paper.pos_cost_basis;
+        row["cash_before"] = (paper.cash + fill_cost + fill_fee);
         row["cash_after"] = paper.cash;
         if (live_execution && daemon_submit_latency_ns >= 0) {
           row["daemon_submit_latency_ns"] = daemon_submit_latency_ns;
@@ -1389,11 +1793,14 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         std::cout << log_pfx << " BUY side=" << paper.side << " slug=" << paper.slug
                   << " S=" << S << " K=" << K << " T_s=" << rem_s << " sigma=" << sigma_use
                   << (sigma_is_fallback ? " (fallback)" : "")
-                  << " theo=" << theo << " bid=" << (want_up ? up_bid : dn_bid) << " ask=" << ask
-                  << " mid=" << mid << " edge=" << edge << " qty=" << qty
-                  << " cost=" << cost << " fee=" << fee
-                  << " spend_target=" << spend_target << " spend=" << cost
-                  << " cash_before=" << (paper.cash + cost + fee) << " cash_after=" << paper.cash;
+                  << " theo=" << theo << " bid=" << (want_up ? up_bid : dn_bid)
+                  << " signal_ask=" << signal_ask << " fill_price=" << fill_avg_price
+                  << (fill_price_estimated ? " (est)" : "")
+                  << " mid=" << mid << " edge=" << edge << " qty=" << fill_qty
+                  << " cost=" << fill_cost << " fee=" << fill_fee
+                  << " spend_target=" << spend_target << " spend=" << fill_cost
+                  << " pos_cost_basis=" << paper.pos_cost_basis
+                  << " cash_before=" << (paper.cash + fill_cost + fill_fee) << " cash_after=" << paper.cash;
         if (live_execution && daemon_submit_latency_ns >= 0) {
           std::cout << " daemon_submit_ms=" << (static_cast<double>(daemon_submit_latency_ns) / 1e6);
         }
@@ -1472,6 +1879,19 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       }
 #endif
       if (sell_qty <= 1e-12) {
+        if (live_execution && exit_is_stop && std::isfinite(clob_balance_shares) &&
+            clob_balance_shares <= 1e-12) {
+          paper.have_pos = false;
+          paper.qty = 0.0;
+          paper.pos_cost_basis = 0.0;
+          paper.entry_fill_price = 0.0;
+          paper.side.clear();
+          paper.slug.clear();
+          paper.token_id.clear();
+          paper.stop_sell_retry = false;
+          paper.pending = false;
+          return;
+        }
         if (live_execution) {
           {
             ll::io::SyncCerrLock _;
@@ -1505,18 +1925,65 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         paper.pending = false;
         return;
       }
-      const double proceeds = sell_qty * bid;
-      const double fee = poly_taker_fee(proceeds, bid, fee_rate);
+      double proceeds = sell_qty * bid;
+      double fee = poly_taker_fee(proceeds, bid, fee_rate);
       const double cash_before = paper.cash;
       std::int64_t daemon_submit_latency_ns = -1;
+      int stop_sell_attempts = 0;
 #ifdef LL_ENABLE_LIVE_TRADER
-      if (live_execution) {
+      if (live_execution && exit_is_stop) {
+        const StopSellUntilFlatResult sfr =
+            live_stop_sell_until_flat(live_ex, paper.token_id, bid, fee_rate);
+        stop_sell_attempts = sfr.attempts;
+        clob_balance_shares = sfr.final_balance;
+        if (!sfr.flat) {
+          paper.stop_sell_retry = true;
+          {
+            ll::io::SyncCerrLock _;
+            std::cerr << log_pfx << " stop-loss FAK incomplete after " << sfr.attempts
+                      << " attempts; clob_balance=" << sfr.final_balance << " — retrying\n";
+            if (!sfr.last_error.empty()) {
+              std::cerr << log_pfx << " last_error: " << sfr.last_error << "\n";
+            }
+          }
+          if (trades_writer.ok()) {
+            nlohmann::json row;
+            row["schema_version"] = 1;
+            row["source"] = src_tag;
+            row["event_type"] = "error";
+            row["action"] = "SELL_STOP_INCOMPLETE";
+            row["exit_reason"] = "stop_loss";
+            row["order_type"] = "FAK";
+            row["slug"] = paper.slug;
+            row["side"] = paper.side;
+            row["token_id"] = paper.token_id;
+            row["stop_sell_attempts"] = sfr.attempts;
+            row["clob_balance"] = sfr.final_balance;
+            row["strategy_qty"] = strategy_qty;
+            if (!sfr.last_error.empty()) {
+              row["error"] = sfr.last_error;
+            }
+            row["local_ts_wall_ms"] = ll::core::system_ms();
+            row["local_ts_mono_ns"] = now_ns;
+            trades_writer.append(row);
+          }
+          paper.cooldown_until_ns = ll::core::steady_ns() + 200'000'000LL;
+          paper.pending = false;
+          return;
+        }
+        paper.stop_sell_retry = false;
+        proceeds = sfr.total_proceeds;
+        fee = sfr.total_fee;
+      } else if (live_execution) {
         ll::execution::OrderIntent oi;
         oi.market_token_id = paper.token_id;
         oi.side = "SELL";
         oi.market_order = true;
         oi.qty = sell_qty;
         oi.mono_ns = now_ns;
+        if (bid > 0.0 && std::isfinite(bid)) {
+          oi.market_worst_price = std::max(0.01, bid);
+        }
         std::string errmsg;
         std::string oid;
         if (!live_ex.submit(oi, &errmsg, &oid, &daemon_submit_latency_ns)) {
@@ -1573,6 +2040,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
         row["event_type"] = "trade";
         row["action"] = "SELL";
         row["exit_reason"] = paper.pending_exit_reason.empty() ? "take_profit" : paper.pending_exit_reason;
+        if (exit_is_stop) {
+          row["order_type"] = "FAK";
+          if (stop_sell_attempts > 0) {
+            row["stop_sell_attempts"] = stop_sell_attempts;
+          }
+        }
         row["slug"] = paper.slug;
         row["side"] = paper.side;
         row["token_id"] = paper.token_id;
@@ -1636,10 +2109,12 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
       paper.have_pos = false;
       paper.qty = 0.0;
       paper.pos_cost_basis = 0.0;
+      paper.entry_fill_price = 0.0;
       paper.side.clear();
       paper.slug.clear();
       paper.token_id.clear();
       paper.pending_exit_reason.clear();
+      paper.stop_sell_retry = false;
       paper.pending = false;
       return;
     }
@@ -1722,6 +2197,10 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
           row["have_pos"] = paper.have_pos;
           row["pos_side"] = paper.side;
           row["pos_qty"] = paper.qty;
+          if (paper.have_pos && paper.entry_fill_price > 0.0) {
+            row["entry_fill_price"] = paper.entry_fill_price;
+            row["pos_cost_basis"] = paper.pos_cost_basis;
+          }
           row["trading_enabled"] = trading_enabled;
         }
         series_writer.append(row);
@@ -1848,6 +2327,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
             paper.pending = false;
             paper.qty = 0.0;
             paper.pos_cost_basis = 0.0;
+          paper.entry_fill_price = 0.0;
             paper.side.clear();
             paper.slug.clear();
             paper.token_id.clear();
@@ -1936,6 +2416,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
               paper.pending = false;
               paper.qty = 0.0;
               paper.pos_cost_basis = 0.0;
+          paper.entry_fill_price = 0.0;
               paper.side.clear();
               paper.slug.clear();
               paper.token_id.clear();
@@ -2048,6 +2529,7 @@ int run_live_impl(bool live_execution, int argc, char** argv) {
                 paper.pending = false;
                 paper.qty = 0.0;
                 paper.pos_cost_basis = 0.0;
+          paper.entry_fill_price = 0.0;
                 paper.side.clear();
                 paper.slug.clear();
                 paper.token_id.clear();

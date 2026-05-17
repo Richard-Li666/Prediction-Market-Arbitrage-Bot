@@ -15,8 +15,12 @@ struct OrderIntent {
   double limit_price = 0.0;
   double qty = 0.0;
   std::string market_token_id;
-  /// If true: daemon posts a FOK market order. BUY: `qty` is USD to spend; SELL: `qty` is shares.
+  /// If true: daemon posts a market order. BUY: `qty` is USD to spend; SELL: `qty` is shares.
   bool market_order = false;
+  /// Market order type passed to poly_daemon (`FAK`, `FOK`, …). Empty → `POLY_MARKET_ORDER_TYPE` env.
+  std::string market_order_type;
+  /// Worst-price limit for market orders (slippage floor). <=0 → daemon/SDK default.
+  double market_worst_price = 0.0;
 };
 
 class PaperExecutor {
@@ -35,12 +39,16 @@ class LiveExecutor {
   // If submit_latency_ns is provided: set to C++→daemon→C++ JSONL round-trip for the POST path (nanoseconds),
   // or -1 if BUILD_LIVE_TRADER is off / daemon did not complete a request.
   bool submit(const OrderIntent& o, std::string* error_message, std::string* out_order_id = nullptr,
-              std::int64_t* submit_latency_ns = nullptr);
+              std::int64_t* submit_latency_ns = nullptr, nlohmann::json* out_submit_resp = nullptr);
 
   /// CLOB conditional token balance in **shares** (for `token_id`), via py_clob balance-allowance API.
   /// Returns false if live trading is disabled, daemon fails, or balance is unavailable.
   bool query_conditional_balance(const std::string& token_id, double* out_shares, std::string* error_message,
                                   std::int64_t* query_latency_ns = nullptr);
+
+  /// CLOB order by id (`get_order`). Returns false if missing or daemon error.
+  bool query_order(const std::string& order_id, nlohmann::json* out_order, std::string* error_message,
+                   std::int64_t* query_latency_ns = nullptr);
 
   /// GARCH(1,1) volatility forecast via poly_daemon (`arch`; cmd `garch_forecast`).
   /// Available when CMake enables `LL_ENABLE_GARCH_DAEMON` (e.g. -DBUILD_DAEMON_GARCH=ON or BUILD_LIVE_TRADER).
